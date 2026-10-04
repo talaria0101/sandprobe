@@ -75,6 +75,20 @@ check_equals "ENOENT is ABSENT"      ABSENT "$(sp_verdict_from_err 'ls: cannot a
 check_equals "not a directory is ABSENT" ABSENT "$(sp_verdict_from_err 'Not a directory')"
 check_equals "timeout is TIMEOUT"    TIMEOUT "$(sp_verdict_from_err 'curl: (28) operation timed out')"
 check_equals "garbage is UNKNOWN"    UNKNOWN "$(sp_verdict_from_err 'something unexpected happened')"
+
+# A bare "denied" is an English word, not a refusal. Matching it made any
+# sentence containing it look like a security denial.
+check_equals "policy note with 'denied' is not DENY" UNKNOWN \
+    "$(sp_verdict_from_err 'mount denied because the filesystem is nosuid')"
+check_equals "past-tense 'denied' is not DENY" UNKNOWN \
+    "$(sp_verdict_from_err 'this mount was denied earlier, now retrying')"
+
+# Resource exhaustion is not a policy denial. Blaming a sandbox boundary for a
+# full disk is a false claim about where the limit is.
+check_equals "ENOSPC is EXHAUSTED"   EXHAUSTED "$(sp_verdict_from_err 'No space left on device')"
+check_equals "EMFILE is EXHAUSTED"    EXHAUSTED "$(sp_verdict_from_err 'Too many open files')"
+check_equals "ENOMEM is EXHAUSTED"    EXHAUSTED "$(sp_verdict_from_err 'Cannot allocate memory')"
+check_equals "ETXTBSY is EXHAUSTED"   EXHAUSTED "$(sp_verdict_from_err 'Text file busy')"
 check_equals "empty is UNKNOWN"      UNKNOWN "$(sp_verdict_from_err '')"
 
 printf '\nthe critical rule: a missing tool is never a denial\n'
@@ -94,7 +108,7 @@ check_contains "invalid verdict becomes UNKNOWN" "UNKNOWN" "$OUT"
 check_contains "invalid verdict is flagged as a bug" "INTERNAL BUG" "$OUT"
 
 printf '\nsp_rec accepts every documented verdict\n'
-for v in ALLOW DENY ABSENT UNKNOWN TIMEOUT UNRESOLVED REFUSED DROPPED; do
+for v in ALLOW DENY ABSENT UNKNOWN TIMEOUT EXHAUSTED UNRESOLVED REFUSED DROPPED; do
     OUT=$(sp_rec test "id" "$v" "d" 2>&1)
     check_contains "$v is passed through" "$v" "$OUT"
 done
@@ -231,6 +245,42 @@ for f in core.sh discover.sh execdir.sh report.sh sect_host.sh sect_security.sh 
          sect_fs.sh sect_env.sh sect_net.sh sect_exec.sh netprobe.py; do
     check_equals "lib/$f present" "yes" "$([ -f "$SP_DIR/lib/$f" ] && echo yes || echo no)"
 done
+
+printf '\nno escalation probe can succeed unconditionally\n'
+# A probe built from a command that always exits 0 reports ALLOW while proving
+# nothing, and that is the single most damaging class of defect in this tool:
+# a reader sees a security test pass. Any sp_esc invocation whose command list
+# starts with true, :, or a bare echo cannot fail, so those are rejected.
+# Match a probe whose COMMAND ITSELF is the no-op, i.e. true, : or echo as the
+# first argument after sp_esc's label. An 'echo' appearing later inside an
+# sh -c fragment is part of a real test, not a stub.
+UNCOND=$(grep -oE 'sp_esc "[^"]*"[[:space:]]+(true|:|echo)[[:space:]]' \
+        "$SP_DIR"/lib/sect_*.sh 2>/dev/null | wc -l | tr -d ' ')
+check_equals "no sp_esc uses an always-succeeding command" 0 "$UNCOND"
+
+# Every escalation record must carry a non-empty detail, or the reader has
+# nothing to check the verdict against.
+NODETAIL=$(grep -oP '^escalation\t[^\t]*\t[A-Z]+\t\t*$' "$SP_DIR"/lib/sect_security.sh 2>/dev/null | wc -l | tr -d ' ')
+check_equals "no empty detail on an escalation literal" 0 "$NODETAIL"
+
+printf '\nfields are named for what they measure\n'
+# securebits_hex once held the output of seccomp/actions_avail. Catch any
+# field whose assignment reads a different file than its name.
+MISNAMED=$(grep -nE 'sp_kv "[a-z_]*(securebits|selinux|apparmor|lsm)[a-z_]*".*actions_avail' \
+        "$SP_DIR"/lib/*.sh 2>/dev/null | wc -l | tr -d ' ')
+check_equals "no field reads seccomp actions but is named otherwise" 0 "$MISNAMED"
+
+printf '\nCI workflow is well formed\n'
+# container: ${{ matrix.container }} with an unset key interpolates to an empty
+# string, which fails the job before any step runs.
+BADCONT=$(grep -cE 'container: *\$\{\{' "$SP_DIR/.github/workflows/test.yml" 2>/dev/null | tr -d ' ')
+check_equals "no interpolated container specifier" 0 "$BADCONT"
+# Every path the workflow acts on must exist in the tree.
+WF_MISSING=0
+for wf_path in sandprobe tests/selftest.sh lib/netprobe.py README.md LICENSE; do
+    [ -f "$SP_DIR/$wf_path" ] || WF_MISSING=$((WF_MISSING + 1))
+done
+check_equals "every path referenced by CI exists" 0 "$WF_MISSING"
 
 printf '\nno hardcoded host identity in the library\n'
 # A username, session id or project path baked into the probe would make the

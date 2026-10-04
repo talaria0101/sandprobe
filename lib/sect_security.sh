@@ -69,7 +69,18 @@ sp_section_security() {
     else
         sp_rec "security" "capabilities" "UNKNOWN" "/proc/self/status unreadable"
     fi
-    sp_kv "securebits_hex" "$(awk '/^Seccomp_mode/{print}' /proc/self/status >/dev/null 2>&1; cat /proc/sys/kernel/seccomp/actions_avail 2>/dev/null | tr '\n' ' ')"
+    # Named for what it is. The previous version of this line was called
+    # securebits_hex while reading seccomp/actions_avail, which is a list of
+    # seccomp return actions and nothing to do with securebits.
+    sp_kv "seccomp_actions_available" "$(cat /proc/sys/kernel/seccomp/actions_avail 2>/dev/null | tr '\n' ' ' || echo UNREADABLE)"
+    # securebits is not exported by procfs on most kernels. Where it is not
+    # readable, say so rather than substituting something else.
+    if [ -r /proc/self/status ]; then
+        _sb=$(awk '/^Securebits/{print $2}' /proc/self/status 2>/dev/null)
+    else
+        _sb=""
+    fi
+    sp_kv "securebits_hex" "${_sb:-NOT EXPORTED BY THIS KERNEL}"
     sp_kv "unprivileged_userns_clone" "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 'sysctl ABSENT on this kernel')"
     sp_kv "max_user_namespaces" "$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo UNREADABLE)"
     sp_kv "unprivileged_bpf_disabled" "$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo UNREADABLE)"
@@ -121,9 +132,9 @@ sp_section_security() {
         case "$_lc" in
             *"unrecognized option"*|*"unrecognised option"*|*"unknown option"*|\
             *"invalid option"*|*"unknown argument"*|*"invalid argument"*|\
-            *"unexpected argument"*|*"usage:"*)
+            *"unexpected argument"*|*"usage:"*|*"not supported"*)
                 sp_rec "escalation" "$_label" "UNKNOWN" \
-                    "probe could not be posed (rc=$_rc): $(printf '%s' "$_out" | head -1)" ;;
+                    "the probe could not be posed: the tool rejected the request rather than the kernel refusing it (rc=$_rc): $(printf '%s' "$_out" | head -1)" ;;
             *"permission denied"*|*"operation not permitted"*|*"not permitted"*|\
             *"access denied"*|*"must be root"*|*"denied"*)
                 sp_rec "escalation" "$_label" "DENY" \
@@ -200,7 +211,20 @@ sp_section_security() {
     # ptrace a sibling: only meaningful if it is refused, and yama may also
     # restrict it. The output carries the real reason either way.
     sp_esc "ptrace_sibling_via_mem"  sh sh -c 'sleep 3 & _p=$!; sleep 0.3; cat /proc/$_p/mem >/dev/null 2>&1; _r=$?; kill $_p 2>/dev/null; wait $_p 2>/dev/null; echo cat_proc_mem_rc=$_r'
-    sp_esc "attach_via_strace"       strace strace -V 2>/dev/null || echo "strace absent; cannot attach"
+    # A real attach attempt, not a version query. `strace -V` prints a version
+    # and always exits 0, so using it here would have reported a successful
+    # attach when no process was ever traced.
+    if sp_have strace; then
+        sp_esc "attach_to_own_child_via_strace" strace \
+            sh -c 'sleep 5 & _p=$!; strace -p $_p -o /dev/null 2>&1; _r=$?; kill $_p 2>/dev/null; wait $_p 2>/dev/null; exit $_r'
+    else
+        # Recorded directly rather than through sp_esc. A stub command that
+        # exits 0 would report a successful attach when no attach happened.
+        sp_rec "escalation" "attach_to_own_child_via_strace" "UNKNOWN" \
+            "strace is not installed, so no attach was attempted; a ptrace ATTACH to a sibling is therefore untested"
+        sp_rec "escalation" "ptrace_proc_mem_of_sibling" "UNKNOWN" \
+            "see ptrace_sibling_via_mem, which tests the same restriction through /proc rather than ptrace(2)"
+    fi
 
     # Reading pid 1. pid 1 is the sandbox's own init in a private pid
     # namespace, so this is not a host escape by itself. It is recorded

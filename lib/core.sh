@@ -139,7 +139,7 @@ sp_raw() {
 sp_rec() {
     __sp_sec="$1"; __sp_id="$2"; __sp_verdict="$3"; __sp_detail="${4-}"
     case "$__sp_verdict" in
-        ALLOW|DENY|ABSENT|UNKNOWN|TIMEOUT|UNRESOLVED|REFUSED|DROPPED) ;;
+        ALLOW|DENY|ABSENT|UNKNOWN|TIMEOUT|EXHAUSTED|UNRESOLVED|REFUSED|DROPPED) ;;
         *) __sp_verdict="UNKNOWN"
            __sp_detail="INTERNAL BUG: invalid verdict '$__sp_verdict' in '$__sp_sec/$__sp_id'" ;;
     esac
@@ -162,41 +162,31 @@ sp_verdict_from_err() {
     case "$__sp_lc" in
         *"read-only file system"*|*"permission denied"*|*"operation not permitted"*|\
         *"not permitted"*|*"access denied"*|*"must be root"*|*"os error 13"*|\
-        *"operation not allowed"*|*"denied"*)
+        *"operation not allowed"*|*"you must be root"*|*"permission is denied"*|\
+        *"not allowed"*|*"prohibited"*)
+            # Every pattern here is a phrase a kernel or a tool uses to state a
+            # refusal. A bare "denied" is deliberately NOT matched: an English
+            # sentence like "mount denied because the filesystem is nosuid" is a
+            # note about policy, not a refusal by this process, and classifying
+            # it as DENY would be a false claim.
             printf 'DENY' ;;
         *"no such file"*|*"not a directory"*|*"nonexistent"*|*"no such device"*|\
-        *"os error 2"*|*"os error 19"*)
+        *"os error 2"*|*"os error 19"*|*"no such process"*|*"no such user"*|\
+        *"no such host"*)
             printf 'ABSENT' ;;
         *"timed out"*|*"timeout"*|*"connection timed out"*)
             printf 'TIMEOUT' ;;
+        *"too many open files"*|*"cannot allocate memory"*|*"out of memory"*|\
+        *"no space left on device"*|*"text file busy"*|*"resource busy"*|\
+        *"too many processes"*|*"quota exceeded"*)
+            # Exhaustion, not policy. Calling these DENY would blame a
+            # sandbox boundary for a full disk or an open file limit.
+            printf 'EXHAUSTED' ;;
         *)
             printf 'UNKNOWN' ;;
     esac
 }
 
-# Escape hatch for the escalation probes: classify a command result using only
-# what that command actually printed, never its wrapper exit status.
-# Usage: sp_verdict_from_cmd "<output>"
-sp_verdict_from_cmd() {
-    sp_verdict_from_err "$1"
-}
-
-# Run a command under a hard time budget. Sets SP_OUT and SP_RC.
-sp_run() {
-    SP_OUT=$(timeout "$SP_BUDGET" "$@" 2>&1)
-    SP_RC=$?
-    return 0
-}
-
-# Same, but for shell fragments.
-sp_sh() {
-    SP_OUT=$(timeout "$SP_BUDGET" sh -c "$1" 2>&1)
-    SP_RC=$?
-    return 0
-}
-
-# Write intent probe. Creates then removes a uniquely named file, so it is
-# idempotent and leaves nothing behind even on the failure paths we can reach.
 # Strip trailing slashes from a path so we never build "//name" when the
 # directory is "/". Done with sed because dash cannot trim a positional
 # parameter directly.

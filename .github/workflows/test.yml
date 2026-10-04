@@ -13,10 +13,6 @@ jobs:
       fail-fast: false
       matrix:
         shell: [dash, bash]
-        include:
-          - shell: sh
-            container: alpine
-    container: ${{ matrix.container }}
 
     steps:
       - uses: actions/checkout@v4
@@ -94,3 +90,34 @@ jobs:
             exit 1
           fi
           echo "unknown section correctly rejected"
+
+  # A different libc and a different shell than Ubuntu's. musl rejects things
+  # glibc tolerates, and Alpine's sh is busybox ash rather than dash, so this
+  # catches portability faults the matrix above cannot.
+  alpine:
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bash for the matrix shell
+        run: apk add --no-cache bash coreutils
+
+      - name: Self-tests under busybox ash and bash
+        run: |
+          set -eu
+          for f in sandprobe lib/*.sh tests/*.sh; do
+            sh -n "$f"
+          done
+          chmod +x sandprobe tests/selftest.sh
+          echo "--- ash ---"
+          ./tests/selftest.sh
+          echo "--- bash ---"
+          bash ./tests/selftest.sh
+
+      - name: Report is produced on musl
+        run: |
+          set -eu
+          ./sandprobe -o report.txt --budget 3 --quiet
+          test -s report.txt
+          echo "report lines: $(wc -l < report.txt)"

@@ -35,6 +35,7 @@ test:
 | The path does not exist | `ABSENT` | `DENY` |
 | The peer reset the connection | `REFUSED` | `DENY`, `DROPPED` |
 | Nothing answered at all | `DROPPED` | `DENY`, `REFUSED` |
+| Disk full, file limit hit | `EXHAUSTED` | `DENY` |
 | The name did not resolve | `UNRESOLVED` | "no network" |
 
 A probe that reports a denial it did not observe is worse than no probe,
@@ -43,6 +44,13 @@ regress.
 
 The verdict set is closed. `sp_rec` refuses to emit anything outside it and
 records an `INTERNAL BUG` line instead, so a typo cannot invent a verdict.
+
+Two distinctions that are easy to get wrong and are guarded by tests:
+
+- The word "denied" in an English sentence is not a refusal. Only specific
+  kernel and tool phrases classify as `DENY`.
+- Running out of disk or file descriptors is not a policy decision. That is
+  `EXHAUSTED`, so a report never blames a sandbox boundary for a full disk.
 
 ## Nothing is hardcoded to one host
 
@@ -158,7 +166,7 @@ code follows because ignoring any of them breaks a real shell:
 ./tests/selftest.sh
 ```
 
-100 checks covering verdict classification, redaction and non-redaction,
+111 checks covering verdict classification, redaction and non-redaction,
 variable-collision resistance, path trimming, live filesystem probes, closed
 vocabulary, source hygiene, and syntax of every file.
 

@@ -346,6 +346,62 @@ fi
 DRV=$(cat "$SP_DIR/sandprobe")
 check_contains "driver calls the summary" "sp_emit_summary" "$DRV"
 
+
+printf '\nno record value spans a line\n'
+# A value containing a newline splits one record into two. Two bugs of that
+# shape shipped: `id -un 2>&1` captured a complaint and a uid together, and
+# `grep -c ... || echo 0` produced the value "0\n0".
+OUT=$(sp_kv "test" "one
+two")
+check_equals "sp_kv flattens a newline in the value" 1 "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')"
+OUT=$(sp_kv "test" "$(printf 'a\tb')")
+check_equals "sp_kv flattens a tab in the value" 1 "$(printf '%s\n' "$OUT" | wc -l | tr -d ' ')"
+# The multi-line grep idiom that produced "0\n0" must not appear at all.
+GREPC=$(grep -vE '^[[:space:]]*#' "$SP_DIR"/lib/*.sh 2>/dev/null \
+        | grep -cE 'grep -c .*\|\| echo')
+check_equals "no 'grep -c ... || echo N' idiom" 0 "$GREPC"
+
+printf '\nthe verdict tally counts every record\n'
+# The tally once matched an explicit list of section names and so hid the eight
+# sections netprobe emits, dropping 64 of 729 records from the count.
+if [ -r "$SP_WORK/tally.body" ]; then
+    :
+fi
+TALLY=$(awk -F'\\t' '
+    $3 ~ /^(ALLOW|DENY|ABSENT|UNKNOWN|TIMEOUT|EXHAUSTED|UNRESOLVED|REFUSED|DROPPED)$/ {
+        n++
+    }
+    END { print n + 0 }
+' "$SP_DIR/lib/report.sh" 2>/dev/null | head -1)
+# The tally must not filter on a section list.
+SECFILT=$(grep -c '\$1 ~ /\^(discover|host)' "$SP_DIR/lib/report.sh" 2>/dev/null || true)
+check_equals "tally does not filter on a section list" 0 "$SECFILT"
+
+printf '\nno bare expansion of a possibly unset variable at top level\n'
+# `set -u` kills the shell when an unset variable is expanded outside a
+# substitution, so an empty environment produced no report at all.
+BARE=$(sed -e 's/#.*$//' "$SP_DIR"/lib/*.sh "$SP_DIR"/sandprobe 2>/dev/null \
+       | grep -cE '[^:$"{]\$(HOME|USER|LOGNAME|TMPDIR|PATH|CARGO_HOME|RUSTUP_HOME)\b')
+check_equals "no unguarded expansion of a set-u variable" 0 "$BARE"
+
+printf '\nan option missing its argument is a usage error, not a crash\n'
+# The guard ran after `shift`, so $1 was unset inside the error branch and
+# set -u killed the shell with status 2 instead of the documented 64.
+SB="$SP_DIR/sandprobe"
+if [ -x "$SB" ]; then
+    for opt in -o -s -b -p; do
+        "$SB" "$opt" >/dev/null 2>&1
+        rc=$?
+        check_equals "missing argument for $opt exits 64" 64 "$rc"
+    done
+fi
+
+printf '\nthe numeric uid is not treated as a user name\n'
+# id -un prints the numeric uid and exits 0 when the host has no passwd entry,
+# which produced /home/0 and 135 records for paths no account owns.
+DIGITUSER=$(sed -e 's/#.*$//' "$SP_DIR/lib/discover.sh" 2>/dev/null | grep -cF '[!0-9]' || true)
+check_equals "discovery filters an all-digit user name" 1 "$DIGITUSER"
+
 printf '\nno hardcoded host identity in the library\n'
 # A username, session id or project path baked into the probe would make the
 # report wrong on any other host.

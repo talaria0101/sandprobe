@@ -93,9 +93,17 @@ sp_discover_mounts() {
 
 # Recover user names from whatever identity sources this host offers.
 sp_discover_users() {
+    # A name that is entirely digits is not a user. `id -un` falls back to
+    # printing the numeric uid, and it exits 0 while doing so, when the host
+    # has no passwd entry for that uid. Taking that as a name produced /home/0
+    # and 135 records for paths that no account owns.
     for v in "${USER:-}" "${LOGNAME:-}" "$(id -un 2>/dev/null)"; do
         [ -n "$v" ] || continue
         [ "$v" = "UNKNOWN" ] && continue
+        case "$v" in
+            *[!0-9]*) : ;;
+            *) continue ;;
+        esac
         printf '%s\n' "$v"
     done > "$SP_WORK/users.env"
 
@@ -247,7 +255,15 @@ sp_section_discover() {
     sp_kv "home_env" "${HOME:-UNSET}"
     sp_kv "user_env" "${USER:-UNSET}"
     sp_kv "logname_env" "${LOGNAME:-UNSET}"
-    sp_kv "id_un" "$(id -un 2>&1)"
+    # id -un prints the complaint on stderr and the numeric uid on stdout, so
+    # capturing 2>&1 produced a two-line value that split one record across two
+    # report lines. Capture each stream separately.
+    _idun=$(id -un 2>/dev/null)
+    _idun_err=$(id -un 2>&1 >/dev/null)
+    sp_kv "id_un" "${_idun:-UNRESOLVED}"
+    if [ -n "$_idun_err" ]; then
+        sp_kv "id_un_diagnostic" "$_idun_err"
+    fi
     # Reflects whether the parsed copy exists, which is the same fact this
     # section went on to use. Reading /proc/self/mountinfo here would test the
     # substituted child's procfs rather than this process's.

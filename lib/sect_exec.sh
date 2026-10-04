@@ -45,8 +45,11 @@ sp_section_exec() {
             fi
         fi
     done > "$SP_WORK/toolres"
-    _found=$(grep -c '^present' "$SP_WORK/toolres" 2>/dev/null || echo 0)
-    _missing=$(grep -c '^missing' "$SP_WORK/toolres" 2>/dev/null || echo 0)
+    # wc -l rather than `grep -c ... || echo 0`: grep -c prints its count and
+    # also exits non-zero when the count is zero, so the fallback appended a
+    # second 0 and the value spanned two report lines.
+    _found=$(grep '^present' "$SP_WORK/toolres" 2>/dev/null | wc -l | tr -d ' ')
+    _missing=$(grep '^missing' "$SP_WORK/toolres" 2>/dev/null | wc -l | tr -d ' ')
     sp_kv "tools_present" "$_found"
     sp_kv "tools_missing" "$_missing"
     sp_raw "# present:"
@@ -222,12 +225,12 @@ sp_section_exec() {
     sp_kv "cargo_bin_dir" "$(command -v cargo 2>/dev/null || echo 'cargo not on PATH')"
     sp_kv "cargo_home" "${CARGO_HOME:-UNSET}"
     if [ -n "${CARGO_HOME:-}" ] && [ ! -d "$CARGO_HOME" ]; then
-        sp_rec "$SP_CUR" "cargo_home_dir" "ABSENT" "CARGO_HOME points at $CARGO_HOME, which does not exist; cargo cannot cache here"
+        sp_rec "$SP_CUR" "cargo_home_dir" "ABSENT" "CARGO_HOME points at ${CARGO_HOME:-}, which does not exist; cargo cannot cache here"
     elif [ -n "${CARGO_HOME:-}" ]; then
         if [ -w "$CARGO_HOME" ]; then
-            sp_rec "$SP_CUR" "cargo_home_dir" "ALLOW" "CARGO_HOME $CARGO_HOME exists and is writable"
+            sp_rec "$SP_CUR" "cargo_home_dir" "ALLOW" "CARGO_HOME ${CARGO_HOME:-} exists and is writable"
         else
-            sp_rec "$SP_CUR" "cargo_home_dir" "DENY" "CARGO_HOME $CARGO_HOME exists but is not writable; cargo cannot cache here"
+            sp_rec "$SP_CUR" "cargo_home_dir" "DENY" "CARGO_HOME ${CARGO_HOME:-} exists but is not writable; cargo cannot cache here"
         fi
     else
         sp_rec "$SP_CUR" "cargo_home_dir" "UNKNOWN" "CARGO_HOME unset"

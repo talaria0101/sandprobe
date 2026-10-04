@@ -62,16 +62,35 @@ sp_emit_summary() {
     printf '%s\n' "# comparable in importance. UNKNOWN is listed because that is where"
     printf '%s\n' "# this report's own uncertainty lives."
 
-    awk -F'\t' '
-        $1 ~ /^(discover|host|security|fs|env|net|exec|escalation|escape-surface|procfs|procfs-traverse|device|credsfile|config|loopback|routes|tool)$/ {
+    # Count every record by its verdict, whatever section it came from.
+    #
+    # An earlier version matched an explicit list of section names and so
+    # silently omitted the eight sections emitted by netprobe.py, hiding 64 of
+    # 729 records including the whole direct-egress, DNS, TLS and proxy
+    # matrix. The tally claimed to count "structured records", so it is
+    # counted by verdict alone: a record is a record.
+    _total=$(awk -F'\t' '
+        $3 ~ /^(ALLOW|DENY|ABSENT|UNKNOWN|TIMEOUT|EXHAUSTED|UNRESOLVED|REFUSED|DROPPED)$/ {
             seen[$3]++
         }
         END {
-            n = 0
-            for (k in seen) { printf "  %-12s %d\n", k, seen[k]; n += seen[k] }
-            printf "  %-12s %d\n", "TOTAL", n
+            for (k in seen) printf "  %-12s %d\n", k, seen[k]
         }
-    ' "$_body" | LC_ALL=C sort
+    ' "$_body" | LC_ALL=C sort)
+    printf '%s\n' "$_total"
+    _t=$(awk -F'\t' '
+        $3 ~ /^(ALLOW|DENY|ABSENT|UNKNOWN|TIMEOUT|EXHAUSTED|UNRESOLVED|REFUSED|DROPPED)$/ { n++ }
+        END { print n + 0 }
+    ' "$_body")
+    printf '  %-12s %d\n' "TOTAL" "$_t"
+
+    # Self-check: the parts must sum to the total, and the total must equal
+    # the number of records outside this summary. A tally that cannot add up
+    # is not worth reading.
+    _parts=$(printf '%s\n' "$_total" | awk '{ s += $2 } END { print s + 0 }')
+    if [ "$_parts" != "$_t" ]; then
+        printf '  %-12s %s\n' "INCONSISTENT" "parts sum to $_parts but TOTAL is $_t"
+    fi
 
     printf '\n%s\n' "# UNKNOWN records, in full. These are the questions this run could not"
     printf '%s\n' "# answer, and they are the first place to look if the report is"

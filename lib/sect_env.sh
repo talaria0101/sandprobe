@@ -75,7 +75,7 @@ sp_section_env() {
     # genuinely bounded. The total size is reported alongside, so nothing is
     # hidden, only not inlined.
     sp_kv "pid1_executable" "$(tr '\0' '\n' < /proc/1/cmdline 2>/dev/null | head -1 || echo UNREADABLE)"
-    sp_kv "pid1_argc" "$(tr '\0' '\n' < /proc/1/cmdline 2>/dev/null | grep -c . || echo UNREADABLE)"
+    sp_kv "pid1_argc" "$(tr '\0' '\n' < /proc/1/cmdline 2>/dev/null | grep . | wc -l | tr -d ' ')"
     sp_kv "pid1_argv_bytes" "$(wc -c < /proc/1/cmdline 2>/dev/null | tr -d ' ' || echo UNREADABLE)"
     sp_kv "pid1_argv_prefix_120b" "$(head -c 120 /proc/1/cmdline 2>/dev/null | tr '\0' ' ' || echo UNREADABLE)"
     sp_kv "pid1_argv_truncated" "$(

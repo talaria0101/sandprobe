@@ -21,7 +21,21 @@
 # SPDX-License-Identifier: 0BSD
 set -u
 
-SP_SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# dirname is required before anything else, and its failure must be reported
+# rather than leaving SP_SELF_DIR as an empty string that resolves to the
+# caller's working directory and produces a confusing "cannot open ./lib/...".
+if ! command -v dirname >/dev/null 2>&1; then
+    echo "sandprobe: dirname is required and was not found on PATH" >&2
+    exit 69
+fi
+SP_SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || {
+    echo "sandprobe: cannot determine the directory of this script" >&2
+    exit 69
+}
+[ -n "$SP_SELF_DIR" ] || {
+    echo "sandprobe: cannot determine the directory of this script" >&2
+    exit 69
+}
 # core.sh cannot derive this itself: while it is being sourced, $0 is the main
 # script, not core.sh, so dirname would give the repository root and every
 # bundled helper would be looked for one directory too high.
@@ -69,13 +83,26 @@ exec        tool resolution, compile-and-run probes, execute surface
 EOF
 }
 
+# need_arg OPTION REMAINING_COUNT
+#
+# The check runs BEFORE the shift. An earlier version shifted first and then
+# expanded $1 in the error branch, so with the option as the last argument $1
+# was unset and `set -u` killed the shell with status 2 instead of the
+# documented 64.
+need_arg() {
+    if [ "$2" -lt 2 ]; then
+        echo "sandprobe: option '$1' needs an argument" >&2
+        exit 64
+    fi
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        -o|--output) shift; [ $# -gt 0 ] || { echo "sandprobe: $1 needs an argument" >&2; exit 64; }; sp_set_report "$1" ;;
-        -s|--section) shift; [ $# -gt 0 ] || { echo "sandprobe: $1 needs an argument" >&2; exit 64; }; SP_SECTIONS="$SP_SECTIONS $1" ;;
+        -o|--output)   need_arg "$1" $#; shift; sp_set_report "$1" ;;
+        -s|--section)  need_arg "$1" $#; shift; SP_SECTIONS="$SP_SECTIONS $1" ;;
         --list-sections) list_sections; exit 0 ;;
-        -b|--budget) shift; [ $# -gt 0 ] || { echo "sandprobe: $1 needs an argument" >&2; exit 64; }; SP_BUDGET="$1" ;;
-        -p|--probe-path) shift; [ $# -gt 0 ] || { echo "sandprobe: $1 needs an argument" >&2; exit 64; }
+        -b|--budget)   need_arg "$1" $#; shift; SP_BUDGET="$1" ;;
+        -p|--probe-path) need_arg "$1" $#; shift
             SANDPROBE_EXTRA_PATHS="${SANDPROBE_EXTRA_PATHS:+$SANDPROBE_EXTRA_PATHS
 }$1" ;;
         --no-redact) SP_REDACT=0 ;;

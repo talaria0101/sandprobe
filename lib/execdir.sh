@@ -17,7 +17,7 @@ sp_exec_candidates() {
         "${SANDPROBE_EXEC_DIR:-}" \
         "$(pwd 2>/dev/null)" \
         "/workspace" \
-        "$HOME" \
+        "${HOME:-}" \
         "/var/tmp" \
         "/dev/shm" \
         "${TMPDIR:-/tmp}"

@@ -85,8 +85,9 @@ sandprobe [OPTIONS]
       --version         version
 ```
 
-Exit status is 0 when the report was produced, 64 for bad usage, 70 when the
-work directory could not be created, 73 when the report could not be written.
+Exit status is 0 when the report was produced, 64 for bad usage, 69 when a
+required tool is missing, 70 when the work directory could not be created, and
+73 when the report could not be written.
 
 ### Sections
 
@@ -166,7 +167,7 @@ code follows because ignoring any of them breaks a real shell:
 ./tests/selftest.sh
 ```
 
-126 checks covering verdict classification, redaction and non-redaction,
+136 checks covering verdict classification, redaction and non-redaction,
 variable-collision resistance, path trimming, live filesystem probes, closed
 vocabulary, source hygiene, and syntax of every file.
 

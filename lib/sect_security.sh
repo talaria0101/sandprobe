@@ -6,8 +6,8 @@ sp_section_security() {
     SP_CUR="security"
 
     printf '\n## IDENTITY\n\n'
-    sp_kv "id_uid_gid_groups" "$(id 2>&1)"
-    sp_kv "whoami" "$(whoami 2>&1)"
+    sp_kv "id_uid_gid_groups" "$(id 2>&1 | tr '\n' ' ')"
+    sp_kv "whoami" "$(whoami 2>&1 | tr '\n' ' ')"
     sp_kv "id_effective" "$(id -u 2>/dev/null):$(id -g 2>/dev/null)"
     sp_kv "euid_egid" "$( (id -u; id -g) 2>/dev/null | tr '\n' ':' )"
     sp_kv "pid" "$$"
@@ -24,7 +24,7 @@ sp_section_security() {
     # genuinely bounded. The total size is reported alongside, so nothing is
     # hidden, only not inlined.
     sp_kv "pid_1_executable" "$(tr '\0' '\n' < /proc/1/cmdline 2>/dev/null | head -1 || echo UNREADABLE)"
-    sp_kv "pid_1_argc" "$(tr '\0' '\n' < /proc/1/cmdline 2>/dev/null | grep -c . || echo UNREADABLE)"
+    sp_kv "pid_1_argc" "$(tr '\0' '\n' < /proc/1/cmdline 2>/dev/null | grep . | wc -l | tr -d ' ')"
     sp_kv "pid_1_argv_bytes" "$(wc -c < /proc/1/cmdline 2>/dev/null | tr -d ' ' || echo UNREADABLE)"
     sp_kv "pid_1_argv_prefix_120b" "$(head -c 120 /proc/1/cmdline 2>/dev/null | tr '\0' ' ' || echo UNREADABLE)"
     sp_kv "pid_1_argv_truncated" "$(
@@ -296,7 +296,10 @@ sp_section_security() {
     # If /proc is mounted with hidepid, foreign pids are invisible. Compare the
     # pid count against what the namespace id suggests.
     sp_kv "proc_mount_options" "$(grep ' /proc ' /proc/$$/mounts 2>/dev/null | awk '{print $4}' || echo 'not a separate /proc mount')"
-    sp_kv "hidepid_option_present" "$(grep ' /proc ' /proc/$$/mounts 2>/dev/null | grep -c hidepid 2>/dev/null || echo 0)"
+    # grep -c prints 0 and exits 1 on no match, so appending `|| echo 0`
+    # produced the two-line value "0\n0" and split one record across two
+    # report lines. Counting with wc keeps the value on one line.
+    sp_kv "hidepid_option_present" "$(grep ' /proc ' /proc/$$/mounts 2>/dev/null | grep -o hidepid | wc -l | tr -d ' ')"
 
     printf '\n## ADDITIONAL ESCAPE SURFACE\n\n'
     printf '%s\n' \
@@ -328,7 +331,7 @@ sp_section_security() {
         "no cgroup v1 release_agent path was writable; see the rows above for each file tried"
 
     # Preload and dynamic linker hijack.
-    for f in /etc/ld.so.preload "$HOME/.ld.so.preload"; do
+    for f in /etc/ld.so.preload "${HOME:-/nonexistent}/.ld.so.preload"; do
         if [ -e "$f" ]; then
             _werr=$(sh -c ': > "$1"' sh "$f" 2>&1)
             if [ -z "$_werr" ]; then
@@ -347,9 +350,9 @@ sp_section_security() {
     sp_kv "ld_library_path_env" "${LD_LIBRARY_PATH:-UNSET}"
 
     # A writable directory on PATH is a binary substitution vector.
-    _oldifs=$IFS; IFS=:
+    _oldifs=${IFS-}; IFS=:
     _writable_path=""
-    for d in $PATH; do
+    for d in ${PATH:-}; do
         [ -n "$d" ] || continue
         if [ -d "$d" ] && [ -w "$d" ]; then
             _writable_path="$_writable_path $d"
@@ -531,12 +534,14 @@ sp_section_security() {
     # itself refuses to be listed? This is the check that matters.
     _trav_targets=$(printf '%s\n' "$SP_MOUNT_RECORDS" | cut -f1 | sed '/^$/d' \
                     | sed '/^\/proc/d' | sed '/^\/dev/d' | LC_ALL=C sort -u)
-    _trav_targets="${_trav_targets}
-/
-/etc
-/tmp
-/workspace
-/state"
+    # Re-deduplicated after the append. Sorting the mount targets alone left
+    # every appended entry that was also a mount target duplicated, so eight
+    # ids were probed twice per base.
+    {
+        printf '%s\n' "$_trav_targets"
+        printf '%s\n' / /etc /tmp /workspace /state
+    } | sed '/^$/d' | LC_ALL=C sort -u > "$SP_WORK/trav.all"
+    _trav_targets=$(cat "$SP_WORK/trav.all")
 
     for base in /proc/1/root /proc/self/root; do
         # Written to a file first: a while loop fed by a pipe is a subshell,
@@ -548,7 +553,7 @@ sp_section_security() {
             if ls "$_full" >/dev/null 2>&1; then
                 _n=$(ls -1 "$_full" 2>/dev/null | wc -l | tr -d ' ')
                 sp_rec "procfs-traverse" "traverse:$_full" "ALLOW" \
-                    "reachable THROUGH $base even though the root itself is not listable; $ _n entries"
+                    "reachable THROUGH $base even though the root itself is not listable; $_n entries"
             elif [ -e "$_full" ]; then
                 sp_rec "procfs-traverse" "traverse:$_full" "DENY" \
                     "exists but refused: $(ls "$_full" 2>&1 >/dev/null | head -1)"

@@ -119,13 +119,24 @@ sp_scrub_pem() {
 
 # Key/value line. Redacted wholesale when the key denotes a secret, otherwise
 # the value is scrubbed for embedded token shapes.
+# A key/value line. The value is flattened to a single line and its separators
+# neutralised before printing.
+#
+# This is not cosmetic. Records are tab separated and the report is read line
+# by line, so a value containing a newline silently splits one record into two
+# and a reader parsing the report sees one measurement where there were none.
+# Two bugs of that shape shipped before this guard existed: `id -un 2>&1`
+# captured a complaint and a uid together, and `grep -c ... || echo 0` produced
+# the value "0\n0".
 sp_kv() {
     __sp_key="$1"; __sp_val="${2-}"
     if sp_secret_name "$__sp_key"; then
         printf '%s = REDACTED\n' "$__sp_key"
-    else
-        printf '%s = %s\n' "$__sp_key" "$(printf '%s' "$__sp_val" | sp_scrub)"
+        return 0
     fi
+    __sp_flat=$(printf '%s' "$__sp_val" | tr '\n\r\t' '   ' | sp_scrub)
+    printf '%s = %s\n' "$__sp_key" "$__sp_flat"
+    return 0
 }
 
 sp_raw() {

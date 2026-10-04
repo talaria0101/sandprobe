@@ -105,6 +105,15 @@ SP_SHAPES='gh[pousr]_[A-Za-z0-9]{16,}
 github_pat_[A-Za-z0-9_]{20,}
 glpat-[A-Za-z0-9_-]{16,}
 (AKIA|ASIA|AROA|AGPA)[A-Z0-9]{16}
+# NOT INCLUDED: the AWS secret access key. It is 40 characters of base64
+# alphabet with no prefix, and matching on length alone destroys ordinary
+# values: a 40-character git SHA and a 40-character hex digest both match, and
+# the self-tests assert that both must survive verbatim. The trade is
+# deliberate, because a git object id in a report is common and load-bearing
+# for a reader diffing two runs, while an AWS secret key reaches a report only
+# when something prints it under a name that does not denote a secret. The
+# by-name layer catches AWS_SECRET_ACCESS_KEY, which is how the value arrives
+# in practice. A bare 40-character secret under a benign name will print.
 sk-ant-[A-Za-z0-9_-]{16,}
 sk-(proj-)?[A-Za-z0-9_-]{20,}
 sk_(live|test)_[A-Za-z0-9]{16,}

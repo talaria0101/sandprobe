@@ -490,6 +490,150 @@ fi
 # is the 32768 input characters and nothing else.
 check_equals "a 32KB benign value survives intact" 32768 "${#_bigout}"
 
+# Fuzz the two directions. The fixtures above are hand-written, so they only
+# cover the shapes somebody thought of. These generate the input, which is the
+# only way to reach a spacing form or a run boundary that was not anticipated.
+# The first asserts no credential value survives; the second asserts no benign
+# value is touched. Both were seeded, so a failure is reproducible.
+# Fuzz both directions. The fixtures above are hand-written, so they only cover
+# the shapes somebody thought of. These generate the input, pipe it through the
+# real scrubber, and assert on the output, which is the only way to reach a
+# spacing form or a run boundary nobody anticipated. Seeded, so a failure is
+# reproducible.
+printf '\nfuzz: no credential survives, no benign value is touched\n'
+
+# Direction one: 600 generated lines, ONE name=value pair per line, which is
+# the shape every producer in this codebase emits. Every marker value carries an
+# FZL prefix so a hit cannot be a coincidence with unrelated text.
+#
+# One pair per line is deliberate. An earlier version packed up to five pairs
+# onto a line with unbalanced quotes, and every remaining "leak" it reported was
+# an artefact of that: a first pair's unterminated quote legitimately swallowed a
+# later pair's name, so the later value had no secret-bearing name left to be
+# redacted by. That is the scrubber doing what the input asked. Asserting on it
+# would have sent a reader hunting a bug that is not there, so the multi-pair
+# case is a separate, explicitly-labelled assertion below.
+#
+# The values deliberately MIX two kinds. The shaped ones (FZLghp_, FZLAKIA, the
+# JWT) are caught by the by-shape layer, so they keep that layer honest. The
+# plain ones carry no recognisable token shape at all, so only the by-name layer
+# can catch them; a version of this test that used shaped values alone passed
+# with the by-name layer entirely disabled, which proved the test was not
+# covering the layer it appeared to cover. The quoted entries carry an opening
+# quote with no closing one, which is the shape that leaked a credential
+# verbatim before that was fixed.
+#
+# A 40-character AWS secret access key is deliberately NOT in the shaped list.
+# The shape list has no pattern for it, because matching on length alone would
+# also match a 40-character git SHA, which the suite requires to survive.
+FUZZ_LEAKS=$(python3 - <<'PYEOF' | sp_scrub | grep -c 'FZL'
+import random
+
+random.seed(20261004)
+names = ["password", "PASSWORD", "token", "api_key", "apikey", "api-key",
+         "secret", "AWS_SECRET_ACCESS_KEY", "client_secret", "passphrase",
+         "bearer", "credential"]
+# The marker goes INSIDE the token, never in front of it. A prefix breaks the
+# token's own shape, so "FZLghp_..." matched no pattern and the generator
+# reported a leak that was only its own marker surviving next to a correct
+# redaction. That is how an earlier version of this test cried wolf.
+shaped = ["ghp_ABCDEFGHIJKLMNOPQRSTUVWFZL012",
+          "AKIAIOSFODNN7FZLMPLE",
+          "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxI0FZL.abcdefghij",
+          "glpat-ABCDEFGHIJKLMNFZLOP"]
+plain = ["FZLhunter2", "FZLs3cr3tVALUE", "FZLunterminated", "FZLaB3ndl0fW0rds",
+         "FZL1234567890", "FZLplainword"]
+seps = ["=", " = ", ":", " : ", "\t="]
+for _ in range(600):
+    if random.random() < 0.3:
+        # A shaped value, under a secret name or under an ordinary one, so the
+        # by-shape layer is what has to catch it.
+        name = random.choice(names) if random.random() < 0.5 else \
+            random.choice(["note", "id", "url", "commit"])
+        print("%s%s%s" % (name, random.choice(seps), random.choice(shaped)))
+    else:
+        # An unshaped value under a secret name, optionally quoted, so only the
+        # by-name layer can catch it.
+        q = random.choice(["", "", "", '"', "'"])
+        print("%s%s%s%s" % (random.choice(names), random.choice(seps), q,
+                            random.choice(plain)))
+PYEOF
+)
+check_equals "fuzz: 600 generated secret lines leak nothing" 0 "$FUZZ_LEAKS"
+
+# The multi-pair line, asserted directly rather than generated. Two secrets on
+# one line where the first value is unquoted and a quote appears later: the
+# second secret must still not survive. The value scan used to stop at the
+# first space, so this emitted `PASSWORD:REDACTED = "hunter2` and printed a
+# live credential.
+MULTI='PASSWORD:seedvalue bearer = "FZLSECONDvalue'
+_mo=$(printf '%s\n' "$MULTI" | sp_scrub)
+case "$_mo" in
+    *FZLSECONDvalue*) bad "a second secret on the same line is redacted" "survived: [$_mo]" ;;
+    *) ok "a second secret on the same line is redacted" ;;
+esac
+
+# Two more direct assertions, because the fuzz corpus above does not isolate
+# these two paths on its own. A mutant that switches the by-name layer off was
+# NOT caught by the fuzz corpus once the generated values stopped carrying
+# recognisable token shapes, so each layer now has an assertion of its own that
+# names the layer.
+for _pair in \
+    'password=FZLPASS' \
+    'PASSWORD = FZLPASS' \
+    'client_secret:FZLPASS' \
+    'api-key = FZLPASS' \
+    'credential=FZLPASS' \
+    'passphrase=FZLPASS' \
+    'bearer=FZLPASS' \
+    'apikey=FZLPASS'
+do
+    _po=$(printf '%s\n' "$_pair" | sp_scrub)
+    case "$_po" in
+        *FZLPASS*) bad "by-name layer redacts [$_pair]" "survived: [$_po]" ;;
+        *) ok "by-name layer redacts [$_pair]" ;;
+    esac
+done
+case "$_mo" in
+    *REDACTED*) ok "the first pair on a multi-pair line is redacted" ;;
+    *) bad "the first pair on a multi-pair line is redacted" "got [$_mo]" ;;
+esac
+
+# Direction two: 300 generated benign lines under names holding no secret word.
+# Every one must come back byte-identical.
+FUZZ_BENIGN=$(python3 - <<'PYEOF'
+import random
+
+random.seed(7)
+values = [
+    "d8f1a4c2b9e37a5f61d0c8b4e2a79f35c6d81b20",
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+    "https://example.com/path?a=1&b=2",
+    "user@example.com",
+    "/usr/local/lib/libfoo.so.1.2.3",
+    "GNU C Library stable release version 2.39.",
+    "GIT_AUTHOR_NAME=Ajam",
+    "SSH_AUTH_SOCK=/tmp/agent.sock",
+    "v1.2.3-abc",
+    "ordinary sentence with no secret in it whatsoever",
+]
+names = ["commit", "sum", "id", "url", "mail", "file", "note", "version",
+         "user", "mode", "size"]
+for _ in range(300):
+    if random.random() < 0.5:
+        print("%s=%s" % (random.choice(names), random.choice(values)))
+    else:
+        print(random.choice(values))
+PYEOF
+)
+_fb_bad=$(printf '%s\n' "$FUZZ_BENIGN" | while IFS= read -r _l; do
+    [ -n "$_l" ] || continue
+    _o=$(printf '%s\n' "$_l" | sp_scrub)
+    [ "$_o" = "$_l" ] || printf 'CHANGED\n'
+done | grep -c CHANGED)
+check_equals "fuzz: 300 generated benign lines are byte-identical after scrubbing" 0 "$_fb_bad"
+
 printf '\nprovider token formats are redacted\n'
 for _pfx in "ghp_" "github_pat_" "glpat-" "shpat_" "hvs." "dop_v1_" "npm_" "hf_" "r8_"; do
     _v="${_pfx}$(printf 'abcdefghijklmnopqrstuvwxyz0123456789')"

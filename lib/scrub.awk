@@ -149,9 +149,18 @@ function scrub_url(s,   n, i, start, scheme, authority, rest_of, at, colon, out,
 # character instead of once per (position, name character) pair.
 function try_kv(s, start,   n, i, c, name, sep, j, value, tail, nameend) {
     n = length(s)
-    if (start > NAME_SPAN) {
-        if (!build_name_ends(s)) return 0
-    }
+    # NAME_END is built once per record by the main action before the walk, so
+    # it is always current for s. An earlier version rebuilt it lazily inside
+    # this function when `start > NAME_SPAN`, which was wrong whenever the new
+    # line was no longer than the previous one: the table was not rebuilt, so a
+    # benign line following a secret line was matched against the earlier
+    # line's names. Observed directly as
+    #     password=A
+    #     note=B
+    #     note=C
+    # emitting `password=REDACTED` on all three lines. Rebuilding per record is
+    # one backward pass per line, which is linear, so nothing is lost by doing
+    # it eagerly rather than lazily.
 
     # The name may not follow ':' or '/', so the authority inside a URL is never
     # read as a name. The URL pass runs first, so this is belt and braces.
@@ -217,13 +226,35 @@ function try_kv(s, start,   n, i, c, name, sep, j, value, tail, nameend) {
 
     value = ""
     tail = ""
-    while (j <= n && substr(NAME_S, j, 1) !~ /[ \t]/) {
+    while (j <= n) {
         c = substr(NAME_S, j, 1)
         # A closing bracket or brace delimits the value rather than belonging
         # to it, so it is preserved.
         if (c ~ /[),\]}>;]/) {
             tail = c
             j++
+            break
+        }
+        # An opening quote inside an unquoted value means the value continues
+        # past the spaces that follow it, to the matching closing quote. This
+        # is what keeps a second secret on the same line from being skipped:
+        # the scan used to stop at the first space, hand the rest of the line
+        # to the character-by-character copy, and emit
+        #   PASSWORD:REDACTED = "hunter2
+        # which is a real credential left in the report.
+        if (c == "\"" || c == "'") {
+            value = value c
+            j++
+            while (j <= n && substr(NAME_S, j, 1) != c) {
+                value = value substr(NAME_S, j, 1)
+                j++
+            }
+            if (j <= n) {
+                value = value c
+                j++
+            }
+            # The value ended at its closing quote. Anything after it is a
+            # delimiter or the start of the next pair, so stop here.
             break
         }
         value = value c
@@ -242,6 +273,10 @@ function try_kv(s, start,   n, i, c, name, sep, j, value, tail, nameend) {
     out = ""
     i = 1
     n = length(s)
+    # Build the name-end index for this line before the walk, once. It must be
+    # rebuilt for every record: a stale table makes a later line inherit an
+    # earlier line's names.
+    build_name_ends(s)
 
     while (i <= n) {
         if (substr(s, i, 6) ~ /^[A-Za-z][A-Za-z0-9+.-]*:/) {

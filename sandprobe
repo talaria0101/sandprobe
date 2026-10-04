@@ -1,0 +1,202 @@
+#!/bin/sh
+# sandprobe - measure a Linux sandbox and report its exact state.
+#
+# Usage: sandprobe [OPTIONS]
+#   -o, --output FILE     write the report to FILE ("-" means stdout, the default)
+#   -s, --section NAME    run only the named section (repeatable)
+#       --list-sections   print the section names and exit
+#   -b, --budget SECONDS  per-probe time budget (default 10)
+#   -p, --probe-path PATH extra path to probe; repeatable, appended to
+#                         SANDPROBE_EXTRA_PATHS
+#       --no-redact       print credential values verbatim (default is to
+#                         redact; only use this when you know why)
+#   -q, --quiet           suppress progress notes on stderr
+#   -h, --help            this text
+#
+# Exit status:
+#   0  the report was produced
+#   64 bad usage
+#   70 the work directory could not be created
+#
+# SPDX-License-Identifier: 0BSD
+set -u
+
+SP_SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# core.sh cannot derive this itself: while it is being sourced, $0 is the main
+# script, not core.sh, so dirname would give the repository root and every
+# bundled helper would be looked for one directory too high.
+export SP_LIB_DIR="$SP_SELF_DIR/lib"
+# shellcheck source=lib/core.sh
+. "$SP_SELF_DIR/lib/core.sh"
+# shellcheck source=lib/report.sh
+. "$SP_SELF_DIR/lib/report.sh"
+# shellcheck source=lib/discover.sh
+. "$SP_SELF_DIR/lib/discover.sh"
+# shellcheck source=lib/execdir.sh
+. "$SP_SELF_DIR/lib/execdir.sh"
+# shellcheck source=lib/sect_host.sh
+. "$SP_SELF_DIR/lib/sect_host.sh"
+# shellcheck source=lib/sect_security.sh
+. "$SP_SELF_DIR/lib/sect_security.sh"
+# shellcheck source=lib/sect_fs.sh
+. "$SP_SELF_DIR/lib/sect_fs.sh"
+# shellcheck source=lib/sect_env.sh
+. "$SP_SELF_DIR/lib/sect_env.sh"
+# shellcheck source=lib/sect_net.sh
+. "$SP_SELF_DIR/lib/sect_net.sh"
+# shellcheck source=lib/sect_exec.sh
+. "$SP_SELF_DIR/lib/sect_exec.sh"
+
+SP_SECTIONS=""
+SP_QUIET=0
+SP_REDACT=1
+
+usage() {
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+list_sections() {
+    cat <<'EOF'
+discover    what was probed, and the evidence each target was derived from
+host        kernel, cpu, memory, time, cgroup limits, rlimits
+security    identity, namespaces, capabilities, seccomp, escalation attempts
+fs          mounts, read/write matrix, devices, disk, fd limits
+env         environment, argv, ancestry, resolver, credential store existence
+net         interfaces, routes, dns, direct egress, proxy connect matrix, tls
+exec        tool resolution, compile-and-run probes, execute surface
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|--output) shift; [ $# -gt 0 ] || { echo "sandprobe: $1 needs an argument" >&2; exit 64; }; sp_set_report "$1" ;;
+        -s|--section) shift; [ $# -gt 0 ] || { echo "sandprobe: $1 needs an argument" >&2; exit 64; }; SP_SECTIONS="$SP_SECTIONS $1" ;;
+        --list-sections) list_sections; exit 0 ;;
+        -b|--budget) shift; [ $# -gt 0 ] || { echo "sandprobe: $1 needs an argument" >&2; exit 64; }; SP_BUDGET="$1" ;;
+        -p|--probe-path) shift; [ $# -gt 0 ] || { echo "sandprobe: $1 needs an argument" >&2; exit 64; }
+            SANDPROBE_EXTRA_PATHS="${SANDPROBE_EXTRA_PATHS:+$SANDPROBE_EXTRA_PATHS
+}$1" ;;
+        --no-redact) SP_REDACT=0 ;;
+        -q|--quiet) SP_QUIET=1 ;;
+        -h|--help) usage; exit 0 ;;
+        --version) printf 'sandprobe %s\n' "$SP_VERSION"; exit 0 ;;
+        *) echo "sandprobe: unknown option '$1'" >&2; usage >&2; exit 64 ;;
+    esac
+    shift
+done
+
+case "$SP_BUDGET" in
+    ''|*[!0-9]*) echo "sandprobe: budget must be a positive integer" >&2; exit 64 ;;
+esac
+[ "$SP_BUDGET" -ge 1 ] || { echo "sandprobe: budget must be at least 1 second" >&2; exit 64; }
+
+export SANDPROBE_BUDGET="$SP_BUDGET"
+export SANDPROBE_EXTRA_PATHS="${SANDPROBE_EXTRA_PATHS:-}"
+
+# When redaction is disabled the scrub stage becomes a pass-through, so the
+# single emission path stays identical and there is no second code path that
+# could drift.
+if [ "$SP_REDACT" -eq 0 ]; then
+    sp_scrub() { cat; }
+    sp_secret_name() { return 1; }
+fi
+
+sp_init
+trap sp_cleanup EXIT HUP INT TERM
+SP_T0=$(date '+%s' 2>/dev/null || echo 0)
+
+# The report goes to the requested path. Writing it is the last step, from a
+# file that the whole run has been accumulating into, so a run that dies
+# halfway still leaves the partial report for inspection instead of nothing.
+REPORT_BUF="$SP_WORK/report.body"
+: > "$REPORT_BUF"
+
+note() { [ "$SP_QUIET" -eq 1 ] || printf 'sandprobe: %s\n' "$1" >&2; }
+
+# Section dispatch. A requested section that does not exist is a usage error,
+# because silently skipping it would under-report.
+run_section() {
+    case "$1" in
+        discover) sp_section_discover ;;
+        host)     sp_section_host ;;
+        security) sp_section_security ;;
+        fs)       sp_section_fs ;;
+        env)      sp_section_env ;;
+        net)      sp_section_net ;;
+        exec)     sp_section_exec ;;
+        *)        echo "sandprobe: unknown section '$1'" >&2; return 64 ;;
+    esac
+    return 0
+}
+
+wanted() {
+    [ -z "$SP_SECTIONS" ] && return 0
+    for s in $SP_SECTIONS; do
+        [ "$s" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# Validate requested section names before doing any work.
+if [ -n "$SP_SECTIONS" ]; then
+    for s in $SP_SECTIONS; do
+        case "$s" in
+            discover|host|security|fs|env|net|exec) ;;
+            *) echo "sandprobe: unknown section '$s'" >&2; list_sections >&2; exit 64 ;;
+        esac
+    done
+fi
+
+# Discovery always runs, because the other sections consume its output.
+# When only 'discover' is asked for, that is the whole job.
+note "discovering probe targets"
+sp_discover_all
+if [ -n "${SANDPROBE_EXTRA_PATHS:-}" ]; then
+    # Re-run the two list builders so operator paths are included.
+    sp_discover_dirs
+    sp_discover_files
+fi
+
+# Route section output into the buffer. sp_kv, sp_raw and sp_rec all print to
+# stdout, so redirecting stdout for the duration of the run is what makes the
+# buffer the report body. The redirect is installed before the header, or the
+# header goes to the terminal and the file starts mid-document.
+exec 3>&1 1>"$REPORT_BUF"
+
+sp_emit_header
+
+wanted discover && sp_section_discover
+wanted host     && { note "probing host";     sp_section_host; }
+wanted security && { note "probing security"; sp_section_security; }
+wanted fs       && { note "probing filesystem"; sp_section_fs; }
+wanted env      && { note "probing environment"; sp_section_env; }
+wanted net      && { note "probing network";  sp_section_net; }
+wanted exec     && { note "probing executables"; sp_section_exec; }
+
+SP_ELAPSED=$(( $(date '+%s' 2>/dev/null || echo 0) - SP_T0 ))
+sp_emit_footer
+
+exec 1>&3 3>&-
+
+# Final pass: scrub the assembled body. Doing it here rather than only at
+# emission time means a value that reached the report through a path that
+# bypassed sp_kv or sp_raw is still caught, and it means there is exactly one
+# place where redaction is decided for the whole document.
+if [ "$SP_REDACT" -eq 1 ]; then
+    sp_scrub_pem < "$REPORT_BUF" | sp_scrub > "$SP_WORK/report.final"
+else
+    cp "$REPORT_BUF" "$SP_WORK/report.final"
+fi
+
+if [ -z "$SP_REPORT" ]; then
+    cat "$SP_WORK/report.final"
+else
+    _dir=$(dirname -- "$SP_REPORT")
+    [ -d "$_dir" ] || { echo "sandprobe: report directory '$_dir' does not exist" >&2; exit 73; }
+    # Write to a sibling temp file then rename, so a reader never sees a
+    # half-written report.
+    cat "$SP_WORK/report.final" > "$SP_REPORT.sp-tmp.$$" || exit 73
+    mv -f "$SP_REPORT.sp-tmp.$$" "$SP_REPORT" || exit 73
+    note "report written to $SP_REPORT ($(wc -l < "$SP_REPORT" | tr -d ' ') lines)"
+fi
+exit 0

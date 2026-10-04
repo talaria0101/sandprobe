@@ -1,0 +1,11 @@
+# Reports and probe artifacts, never committed.
+report.txt
+a.txt
+b.txt
+sec-*.txt
+*.report.txt
+.sandprobe-*
+
+# Python bytecode cache
+__pycache__/
+*.pyc

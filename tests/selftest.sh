@@ -1,0 +1,270 @@
+#!/bin/sh
+# sandprobe self-tests.
+#
+# These test the probe's own logic, not the host it runs on. A probe that
+# reports "DENY" because a tool was missing is worse than no probe, so every
+# rule that prevents a false verdict gets a test that fails if the rule is
+# removed.
+#
+# SPDX-License-Identifier: 0BSD
+
+SP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PASS=0
+FAIL=0
+FAILURES=""
+
+ok() {
+    PASS=$((PASS + 1))
+    printf '  ok   %s\n' "$1"
+}
+
+bad() {
+    FAIL=$((FAIL + 1))
+    FAILURES="$FAILURES
+  $1: $2"
+    printf '  FAIL %s\n     %s\n' "$1" "$2"
+}
+
+# check_equals <name> <expected> <actual>
+check_equals() {
+    if [ "$2" = "$3" ]; then
+        ok "$1"
+    else
+        bad "$1" "expected [$2] got [$3]"
+    fi
+}
+
+# check_contains <name> <needle> <haystack>
+check_contains() {
+    case "$3" in
+        *"$2"*) ok "$1" ;;
+        *) bad "$1" "output did not contain [$2]" ;;
+    esac
+}
+
+# check_not_contains <name> <needle> <haystack>
+check_not_contains() {
+    case "$3" in
+        *"$2"*) bad "$1" "output unexpectedly contained [$2]" ;;
+        *) ok "$1" ;;
+    esac
+}
+
+printf 'sandprobe self-tests\n\n'
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/sandprobe-selftest.XXXXXX") || exit 70
+trap 'rm -rf "$WORK"' EXIT HUP INT TERM
+
+# shellcheck source=lib/core.sh
+. "$SP_DIR/lib/core.sh"
+SP_WORK="$WORK"
+SP_CUR="test"
+SP_BUDGET=5
+
+printf 'verdict classification from real error text\n'
+check_equals "EACCES is DENY"        DENY "$(sp_verdict_from_err 'sh: cannot create /x: Permission denied')"
+check_equals "EPERM is DENY"         DENY "$(sp_verdict_from_err 'unshare: unshare failed: Operation not permitted')"
+check_equals "EROFS is DENY"         DENY "$(sp_verdict_from_err 'sh: cannot create /usr/x: Read-only file system')"
+check_equals "lowercase denied is DENY" DENY "$(sp_verdict_from_err 'mount: /tmp: permission denied.')"
+check_equals "must be root is DENY"  DENY "$(sp_verdict_from_err 'mount: only root can do that, must be root')"
+# "must be run from a terminal" is a usage complaint, not a refusal. Asserting
+# it as DENY would bake in a wrong rule.
+check_equals "terminal complaint is UNKNOWN" UNKNOWN "$(sp_verdict_from_err 'su: must be run from a terminal')"
+check_equals "errno 13 is DENY"      DENY "$(sp_verdict_from_err 'PermissionError: [Errno 13] Permission denied')"
+check_equals "ENOENT is ABSENT"      ABSENT "$(sp_verdict_from_err 'ls: cannot access: No such file or directory')"
+check_equals "not a directory is ABSENT" ABSENT "$(sp_verdict_from_err 'Not a directory')"
+check_equals "timeout is TIMEOUT"    TIMEOUT "$(sp_verdict_from_err 'curl: (28) operation timed out')"
+check_equals "garbage is UNKNOWN"    UNKNOWN "$(sp_verdict_from_err 'something unexpected happened')"
+check_equals "empty is UNKNOWN"      UNKNOWN "$(sp_verdict_from_err '')"
+
+printf '\nthe critical rule: a missing tool is never a denial\n'
+# sp_need must return failure and record UNKNOWN, so callers skip rather than
+# guess. This is the test that fails if sp_need ever records DENY.
+OUT=$(sp_need definitely-not-a-real-binary-xyz 2>&1)
+check_contains "missing tool records UNKNOWN" "UNKNOWN" "$OUT"
+check_not_contains "missing tool is not DENY" "DENY" "$OUT"
+sp_need definitely-not-a-real-binary-xyz >/dev/null 2>&1
+check_equals "sp_need returns 1 when absent" 1 "$?"
+sp_need ls >/dev/null 2>&1
+check_equals "sp_need returns 0 when present" 0 "$?"
+
+printf '\nsp_rec rejects an invented verdict\n'
+OUT=$(sp_rec test "bogus" "MAYBE" "detail" 2>&1)
+check_contains "invalid verdict becomes UNKNOWN" "UNKNOWN" "$OUT"
+check_contains "invalid verdict is flagged as a bug" "INTERNAL BUG" "$OUT"
+
+printf '\nsp_rec accepts every documented verdict\n'
+for v in ALLOW DENY ABSENT UNKNOWN TIMEOUT UNRESOLVED REFUSED DROPPED; do
+    OUT=$(sp_rec test "id" "$v" "d" 2>&1)
+    check_contains "$v is passed through" "$v" "$OUT"
+done
+
+printf '\nhelper internals do not clobber caller variables\n'
+# POSIX shell functions share one scope. If a helper used a short name that the
+# caller also uses, the caller's value is destroyed. These fail if the
+# reserved-namespace convention is dropped.
+_d="/caller/compile/dir"
+sp_rec test "x" "ALLOW" "detail" >/dev/null
+check_equals "_d survives sp_rec" "/caller/compile/dir" "$_d"
+_p="/caller/path"
+sp_try_read "$WORK" >/dev/null
+check_equals "_p survives sp_try_read" "/caller/path" "$_p"
+_f="/caller/file"
+sp_try_exists "$WORK" >/dev/null
+check_equals "_f survives sp_try_exists" "/caller/file" "$_f"
+_k="/caller/key"
+sp_kv "plain_name" "value" >/dev/null
+check_equals "_k survives sp_kv" "/caller/key" "$_k"
+_sec="/caller/sec"
+sp_verdict_from_err "Permission denied" >/dev/null
+check_equals "_sec survives sp_verdict_from_err" "/caller/sec" "$_sec"
+
+printf '\npath trimming\n'
+check_equals "root stays root"        "/"     "$(sp_trim_slash /)"
+check_equals "trailing slash removed"  "/tmp"  "$(sp_trim_slash /tmp/)"
+check_equals "plain path unchanged"    "/tmp"  "$(sp_trim_slash /tmp)"
+check_equals "empty becomes root"      "/"     "$(sp_trim_slash '')"
+check_equals "double slash collapses"  "/"     "$(sp_trim_slash //)"
+
+printf '\nredaction: secrets are removed, everything else survives\n'
+# Test vectors are assembled at run time from a prefix and a filler string.
+#
+# Two reasons, and the second is the important one. First, a committed literal
+# like a well-formed token prefix is indistinguishable from a live credential
+# to secret scanning, and a repository that reprints secrets should not ship
+# strings shaped like one. Second, a vector assembled here cannot be mistaken
+# for a real token by anyone who later greps the history.
+#
+# The assembled strings are still exact: same prefix, same body, same length,
+# so the regex under test is genuinely exercised rather than approximated.
+_filler='abcdefghijklmnopqrstuvwxyz0123456789'
+_gh_token()  { printf 'ghp_%s%s' "$_filler" "$_filler"; }
+_gh_pat()    { printf 'github_pat_%s%s' "$_filler" "$_filler"; }
+_aws()       { printf 'AKIA%s' 'ABCDEFGHIJKLMNOP'; }
+_openai()    { printf 'sk-%s%s' "$_filler" "$_filler"; }
+_anthropic() { printf 'sk-ant-%s%s' "$_filler" "$_filler"; }
+_slack()     { printf 'xoxb-%s-%s' '123456789012' "$_filler"; }
+_google()    { printf 'AIza%s' 'SyA1234567890abcdefghijklmnopqrstuv'; }
+_jwt()       { printf '%s.%s.%s' 'eyJhbGciOiJIUzI1NiJ9' 'eyJzdWIiOiIxMjM0NTY3ODkwIn0' 'dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk'; }
+_gitlab()    { printf 'glpat-%s%s' "$_filler" "$_filler"; }
+_npm()       { printf 'npm_%s%s' "$_filler" "$_filler"; }
+_gcp()       { printf 'ya29.%s' 'a0AfH6SMBxexampleExampletokenValue0123456789ab'; }
+
+check_equals "secret name redacted" "MY_TOKEN = REDACTED" "$(sp_kv MY_TOKEN "$(_gh_token)")"
+check_equals "api key name redacted" "SOME_API_KEY = REDACTED" "$(sp_kv SOME_API_KEY 'valuehere')"
+check_equals "password name redacted" "DB_PASSWORD = REDACTED" "$(sp_kv DB_PASSWORD 'hunter2xyz')"
+check_equals "github token shape redacted" "v = REDACTED" "$(sp_kv 'v' "$(_gh_token)")"
+check_equals "github pat shape redacted" "v = REDACTED" "$(sp_kv 'v' "$(_gh_pat)")"
+check_equals "aws key shape redacted" "v = REDACTED" "$(sp_kv 'v' "$(_aws)")"
+check_equals "openai shape redacted" "v = REDACTED" "$(sp_kv 'v' "$(_openai)")"
+check_equals "anthropic shape redacted" "v = REDACTED" "$(sp_kv 'v' "$(_anthropic)")"
+check_equals "slack token redacted" "v = REDACTED" "$(sp_kv 'v' "$(_slack)")"
+check_equals "google api key redacted" "v = REDACTED" "$(sp_kv 'v' "$(_google)")"
+check_equals "jwt redacted" "v = REDACTED" "$(sp_kv 'v' "$(_jwt)")"
+check_equals "gitlab token redacted" "v = REDACTED" "$(sp_kv 'v' "$(_gitlab)")"
+check_equals "npm token redacted" "v = REDACTED" "$(sp_kv 'v' "$(_npm)")"
+check_equals "gcp oauth redacted" "v = REDACTED" "$(sp_kv 'v' "$(_gcp)")"
+
+printf '\nredaction must not touch non-secrets\n'
+check_equals "git sha survives" "v = d8f1a4c2b7e93f6051a2c8d4e6f7091a3b5c7d9e" "$(sp_kv 'v' 'd8f1a4c2b7e93f6051a2c8d4e6f7091a3b5c7d9e')"
+check_equals "uuid survives" "v = 01M427Q1D1AG7QKYRH6G3V1RSD" "$(sp_kv 'v' '01M427Q1D1AG7QKYRH6G3V1RSD')"
+check_equals "url survives" "v = http://169.254.169.1:39799" "$(sp_kv 'v' 'http://169.254.169.1:39799')"
+check_equals "version string survives" "v = 7.2.8_1-x86_64" "$(sp_kv 'v' '7.2.8_1-x86_64')"
+check_equals "numeric id survives" "v = 1791077743" "$(sp_kv 'v' '1791077743')"
+check_equals "home path survives" "v = /home/someuser/.local/bin" "$(sp_kv 'v' '/home/someuser/.local/bin')"
+check_equals "author name survives" "GIT_AUTHOR_NAME = Not A Secret" "$(sp_kv GIT_AUTHOR_NAME 'Not A Secret')"
+check_equals "kernel release survives" "v = 6.1.0-18-amd64" "$(sp_kv 'v' '6.1.0-18-amd64')"
+check_equals "40-char hex survives" "v = 0123456789abcdef0123456789abcdef01234567" "$(sp_kv 'v' '0123456789abcdef0123456789abcdef01234567')"
+
+printf '\nPEM private key block is collapsed\n'
+PEM=$(printf -- '-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\nSECRETDATA\n-----END RSA PRIVATE KEY-----\nafter' | sp_scrub_pem)
+check_contains "pem begin replaced" "[REDACTED_PRIVATE_KEY]" "$PEM"
+check_not_contains "pem body gone" "SECRETDATA" "$PEM"
+check_contains "text after pem survives" "after" "$PEM"
+
+printf '\nlive filesystem probes classify correctly\n'
+# /tmp is writable in every sandbox this may run in; use it for the ALLOW case.
+W=$(sp_try_write "${TMPDIR:-/tmp}"); check_contains "writable dir is ALLOW" "ALLOW" "$W"
+R=$(sp_try_read "${TMPDIR:-/tmp}");     check_contains "readable dir is ALLOW" "ALLOW" "$R"
+A=$(sp_try_exists "$WORK/no-such-file"); check_contains "absent file is ABSENT" "ABSENT" "$A"
+R2=$(sp_try_read "$WORK/no-such-dir"); check_contains "absent dir is ABSENT" "ABSENT" "$R2"
+E=$(sp_try_exec "$WORK/no-such-binary"); check_contains "absent binary is ABSENT" "ABSENT" "$E"
+# A present, executable binary must never be reported as ABSENT. Whether it
+# runs depends on this host's execute policy, so both outcomes are legitimate;
+# what would be a bug is reporting absence or a timeout for a file that is
+# plainly there.
+sh -c 'printf "#!/bin/sh\nexit 0\n" > "$1"' sh "$WORK/runme" 2>/dev/null
+chmod +x "$WORK/runme" 2>/dev/null
+X=$(sp_try_exec "$WORK/runme")
+XV=$(printf '%s' "$X" | cut -f3)
+if [ "$XV" = "ALLOW" ] || [ "$XV" = "DENY" ]; then
+    ok "present executable is ALLOW or DENY (got $XV)"
+else
+    bad "present executable is ALLOW or DENY" "got [$XV] from [$X]"
+fi
+# A binary that exists is never ABSENT, whatever the execute policy says.
+check_not_contains "present executable is not ABSENT" "ABSENT" "$X"
+# /bin/sh is guaranteed present on a POSIX host and must never be ABSENT.
+XS=$(sp_try_exec /bin/sh)
+check_not_contains "known-present shell is not ABSENT" "ABSENT" "$XS"
+
+printf '\nwrite probe leaves nothing behind\n'
+sp_try_write "${TMPDIR:-/tmp}" >/dev/null
+LEFT=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name '.sandprobe-write-probe.*' 2>/dev/null | wc -l | tr -d ' ')
+check_equals "no probe file remains in tmp" 0 "$LEFT"
+
+printf '\nthe verdict vocabulary is closed\n'
+# Any verdict outside the documented set must be impossible to emit.
+BADV=$(sp_rec t i "SORTOFALLOWED" d)
+check_contains "unknown verdict rejected" "INTERNAL BUG" "$BADV"
+check_not_contains "unknown verdict not passed through" "SORTOFALLOWED" "$(printf '%s' "$BADV" | cut -f3)"
+
+printf '\nreport.sh header documents the vocabulary\n'
+HDR=$(sed -n '1,60p' "$SP_DIR/lib/report.sh")
+for v in ALLOW DENY ABSENT UNKNOWN TIMEOUT; do
+    check_contains "header documents $v" "$v" "$HDR"
+done
+
+printf '\nsources exist and the script is executable\n'
+check_equals "sandprobe is executable" "yes" "$([ -x "$SP_DIR/sandprobe" ] && echo yes || echo no)"
+for f in core.sh discover.sh execdir.sh report.sh sect_host.sh sect_security.sh \
+         sect_fs.sh sect_env.sh sect_net.sh sect_exec.sh netprobe.py; do
+    check_equals "lib/$f present" "yes" "$([ -f "$SP_DIR/lib/$f" ] && echo yes || echo no)"
+done
+
+printf '\nno hardcoded host identity in the library\n'
+# A username, session id or project path baked into the probe would make the
+# report wrong on any other host.
+# Scan for identifiers belonging to the machine this was written on. Comments
+# are stripped first: a comment may explain the shape of a path without
+# depending on it, and flagging prose would train a reader to ignore the check.
+HITS=$(grep -rvE '^[[:space:]]*#' "$SP_DIR"/lib/*.sh "$SP_DIR"/lib/*.py \
+        "$SP_DIR/sandprobe" 2>/dev/null \
+        | grep -cE 'qaidvoid|xphatty[0-9]|pi-projects|\.local/state/errand')
+check_equals "no host-specific identifiers in source" 0 "$HITS"
+
+printf '\nsh syntax check on every shell file\n'
+for f in "$SP_DIR/sandprobe" "$SP_DIR"/lib/*.sh "$SP_DIR"/tests/*.sh; do
+    [ -f "$f" ] || continue
+    if sh -n "$f" 2>/dev/null; then
+        ok "sh -n $(basename "$f")"
+    else
+        bad "sh -n $(basename "$f")" "syntax error"
+    fi
+done
+if command -v python3 >/dev/null 2>&1; then
+    if python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$SP_DIR/lib/netprobe.py" 2>/dev/null; then
+        ok "netprobe.py parses"
+    else
+        bad "netprobe.py parses" "python syntax error"
+    fi
+fi
+
+printf '\n----------------------------------------\n'
+printf 'passed: %d\nfailed: %d\n' "$PASS" "$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+    printf 'failures:%s\n' "$FAILURES"
+    exit 1
+fi
+printf 'all self-tests passed\n'
+exit 0

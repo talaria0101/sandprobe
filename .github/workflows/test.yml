@@ -1,0 +1,96 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [dash, bash]
+        include:
+          - shell: sh
+            container: alpine
+    container: ${{ matrix.container }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-tests under ${{ matrix.sh }}
+        run: |
+          set -eu
+          for f in sandprobe lib/*.sh tests/*.sh; do
+            ${{ matrix.sh }} -n "$f"
+          done
+          chmod +x sandprobe tests/selftest.sh
+          ./tests/selftest.sh
+
+      - name: Report is produced
+        run: |
+          set -eu
+          chmod +x ./sandprobe
+          ./sandprobe -o report.txt --budget 3 --quiet
+          test -s report.txt
+          echo "report lines: $(wc -l < report.txt)"
+
+      - name: Report contains no credential values
+        run: |
+          set -eu
+          # The runner injects a token into the environment. It must appear as
+          # REDACTED and never as a value. This is the check that matters most,
+          # because a report is designed to be shared.
+          if grep -qE 'gh[pousr]_[A-Za-z0-9]{16,}' report.txt; then
+            echo "FAIL: a GitHub token value leaked into the report"
+            grep -oE 'gh[pousr]_[A-Za-z0-9]{16,}' report.txt | head
+            exit 1
+          fi
+          echo "no token value in report"
+
+      - name: Report is idempotent
+        run: |
+          set -eu
+          ./sandprobe -o a.txt --budget 3 --quiet
+          ./sandprobe -o b.txt --budget 3 --quiet
+          # Record sets must match exactly; values and timestamps may drift.
+          grep -P '^\w+\t' a.txt | cut -f1,2 | LC_ALL=C sort > ka
+          grep -P '^\w+\t' b.txt | cut -f1,2 | LC_ALL=C sort > kb
+          diff ka kb
+          echo "record sets identical across runs"
+
+      - name: No leftovers behind
+        run: |
+          set -eu
+          if ls -d "${TMPDIR:-/tmp}"/sandprobe.* >/dev/null 2>&1; then
+            echo "FAIL: sandprobe left a work directory behind"
+            ls -d "${TMPDIR:-/tmp}"/sandprobe.*
+            exit 1
+          fi
+          if find . -name '.sandprobe-*' | grep -q .; then
+            echo "FAIL: probe files left behind"
+            find . -name '.sandprobe-*'
+            exit 1
+          fi
+          echo "clean"
+
+      - name: Section selection works
+        run: |
+          set -eu
+          for s in discover host security fs env net exec; do
+            ./sandprobe -s "$s" -o "sec-$s.txt" --budget 2 --quiet
+            test -s "sec-$s.txt" || { echo "FAIL: section $s produced nothing"; exit 1; }
+          done
+          echo "all seven sections produced a report"
+
+      - name: Unknown section is a usage error
+        run: |
+          set -eu
+          if ./sandprobe -s nosuchsection -o /dev/null --quiet 2>/dev/null; then
+            echo "FAIL: an unknown section exited 0"
+            exit 1
+          fi
+          echo "unknown section correctly rejected"

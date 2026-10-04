@@ -38,14 +38,20 @@ sp_section_env() {
 
     printf '\n## SECRET-BEARING VARIABLE INVENTORY\n\n'
     sp_raw "# Names only. Values are never printed here."
+    sp_raw "# A name is listed when it CONTAINS a secret word, which is a substring"
+    sp_raw "# test rather than an assertion that the value is a credential. A"
+    sp_raw "# policy declaration such as SANDHOME_PASSWD (a path) or"
+    sp_raw "# SANDHOME_PASSWD_USERS (a list of account names) matches on the word"
+    sp_raw "# and is listed here. Read each name against its own value before"
+    sp_raw "# concluding anything about it."
     _found=0
     for n in $(env 2>/dev/null | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | LC_ALL=C sort); do
         if sp_secret_name "$n"; then
-            sp_kv "secret_var_present" "$n"
+            sp_kv "secret_word_name_present" "$n"
             _found=1
         fi
     done
-    [ "$_found" -eq 0 ] && sp_raw "# no variable name in this environment denotes a secret"
+    [ "$_found" -eq 0 ] && sp_raw "# no variable name in this environment contains a secret word"
 
     printf '\n## TOKEN SHAPES PRESENT IN ENVIRONMENT\n\n'
     sp_raw "# Presence only. This proves the redaction layer has work to do and"

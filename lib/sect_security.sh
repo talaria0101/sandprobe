@@ -364,6 +364,79 @@ sp_section_security() {
     sp_kv "ld_preload_env" "${LD_PRELOAD:-UNSET}"
     sp_kv "ld_audit_env" "${LD_AUDIT:-UNSET}"
     sp_kv "ld_library_path_env" "${LD_LIBRARY_PATH:-UNSET}"
+    # Resolve what LD_PRELOAD actually names. A sandbox that installs an
+    # LD_PRELOAD interposer changes what every process in it observes: /proc
+    # fields can be rewritten in place, isatty can answer true for a pipe, and
+    # a stat of a display or input node can return another device's identity.
+    # Every value below this point is then a property of the interposer as much
+    # as of the host, so the report says which libraries are in the chain and
+    # whether they came from the environment or from /etc/ld.so.preload.
+    if [ -n "${LD_PRELOAD:-}" ]; then
+        _pre_src="the environment"
+    elif [ -s /etc/ld.so.preload ]; then
+        _pre_src="/etc/ld.so.preload"
+    else
+        _pre_src=""
+    fi
+    if [ -z "$_pre_src" ]; then
+        sp_kv "ld_preload_chain" "none; no LD_PRELOAD in the environment and no /etc/ld.so.preload, so no interposer library is known to be in the chain"
+    else
+        _pre_resolved=""
+        _pre_missing=""
+        _oldsifs=${IFS-}; IFS=:
+        for _lib in ${LD_PRELOAD:-} $(cat /etc/ld.so.preload 2>/dev/null); do
+            [ -n "$_lib" ] || continue
+            if [ -e "$_lib" ]; then
+                _pre_resolved="$_pre_resolved $_lib -> $(readlink -f "$_lib" 2>/dev/null || echo UNRESOLVED)"
+            else
+                _pre_missing="$_pre_missing $_lib"
+            fi
+        done
+        IFS=$_oldsifs
+        sp_kv "ld_preload_chain_source" "$_pre_src"
+        sp_kv "ld_preload_chain" "${_pre_resolved:-none resolved}"
+        if [ -n "$_pre_missing" ]; then
+            sp_kv "ld_preload_chain_missing" "$_pre_missing"
+        fi
+        sp_kv "ld_preload_caveat" "an LD_PRELOAD library can interpose on libc calls including open, stat and isatty, so a measurement taken in this process may reflect the library rather than the kernel; the /proc/self/status probe below cross-checks two read paths for exactly that"
+    fi
+
+    # Whether anything is interposing on reads of this process's own status.
+    # Two read paths are compared because a preload shim that rewrites
+    # /proc/*/status reaches open and openat but not libc's internal fopen, so
+    # a disagreement between the two is positive evidence of an interposer
+    # rather than an inference about one.
+    #
+    # /proc/$$ and not /proc/self: inside $( ) the latter names the substituted
+    # child, so the field would describe an awk rather than this shell. That is
+    # the substitution bug the self-test guards against, and the python side
+    # below is a separate process whose own /proc/self is what it must read.
+    if [ -r /proc/$$/status ]; then
+        _sp_a=$(awk '/^TracerPid:|^NoNewPrivs:|^Seccomp:/{print $1"="$2}' /proc/$$/status 2>/dev/null | tr '\n' ' ')
+        _sp_b=$(python3 -c '
+import sys
+try:
+    with open("/proc/self/status") as fh:
+        rows = [l.split(None, 1) for l in fh if l.split(None, 1)[0] in
+                ("TracerPid:", "NoNewPrivs:", "Seccomp:")]
+    sys.stdout.write(" ".join("%s=%s" % (r[0], r[1].strip()) for r in rows) + " ")
+except Exception:
+    pass
+' 2>/dev/null)
+        sp_kv "tracer_pid" "$(awk '/^TracerPid:/{print $2}' /proc/$$/status 2>/dev/null || echo UNREADABLE)"
+        if [ -n "$_sp_a" ] && [ -n "$_sp_b" ]; then
+            if [ "$_sp_a" = "$_sp_b" ]; then
+                sp_rec "escape-surface" "proc_status_read_paths_agree" "ALLOW" \
+                    "two independent read paths of /proc/self/status report the same TracerPid, NoNewPrivs and Seccomp, so no interposer is rewriting them here: $_sp_a"
+            else
+                sp_rec "escape-surface" "proc_status_read_paths_agree" "ALLOW" \
+                    "WARNING: the two read paths DISAGREE, which is evidence that something is rewriting /proc/self/status. via-path=[$_sp_a] fopen-path=[$_sp_b]"
+            fi
+        else
+            sp_rec "escape-surface" "proc_status_read_paths_agree" "UNKNOWN" \
+                "could not read /proc/$$/status through both paths, so the cross-check did not run: via-path=[$_sp_a] fopen-path=[$_sp_b]"
+        fi
+    fi
 
     # A writable directory on PATH is a binary substitution vector.
     _oldifs=${IFS-}; IFS=:
@@ -496,8 +569,25 @@ sp_section_security() {
             if [ -n "$_other" ]; then
                 sp_kv "syscalls_other_errno" "$_other"
             fi
-            sp_rec "escape-surface" "privileged_syscalls" "ALLOW" \
-                "every syscall probed with NULL arguments was refused; see syscalls_not_invoked for the calls that dereference their arguments and are therefore not invoked"
+            # The verdict on an escape-surface row is about the ESCAPE, not
+            # about the syscalls. This row used to be hardcoded ALLOW while its
+            # own detail said every syscall was refused, so a reader scanning
+            # the escape-surface section for ALLOW, which is the query a
+            # reviewer actually makes, would conclude privileged syscalls were
+            # available here. The verdict now follows the data: a syscall that
+            # was not refused means the escape is available, and anything that
+            # failed for a reason that is neither a refusal nor a permission
+            # leaves the question open rather than answering it.
+            if [ -n "$_permitted" ] && [ "$_permitted" != "none" ]; then
+                sp_rec "escape-surface" "privileged_syscalls" "ALLOW" \
+                    "these syscalls were NOT refused, so the primitive they provide is available: $_permitted; refused: ${_refused:-none}"
+            elif [ -n "$_other" ]; then
+                sp_rec "escape-surface" "privileged_syscalls" "UNKNOWN" \
+                    "every syscall probed with NULL arguments was refused except these, which failed for a reason that is neither a refusal nor a permission, so the boundary is not established: $_other; see syscalls_not_invoked for the calls that dereference their arguments and are therefore not invoked"
+            else
+                sp_rec "escape-surface" "privileged_syscalls" "DENY" \
+                    "every syscall probed with NULL arguments was refused; see syscalls_not_invoked for the calls that dereference their arguments and are therefore not invoked"
+            fi
         fi
     else
         sp_rec "escape-surface" "privileged_syscalls" "UNKNOWN" \

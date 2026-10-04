@@ -8,6 +8,27 @@ SP_VERSION="1.0.0"
 # Directory holding the library, resolved once so every section can find the
 # bundled helpers regardless of the caller's working directory.
 SP_LIB_DIR=${SP_LIB_DIR:-$(CDPATH= cd -- "$(dirname -- "${0}")" 2>/dev/null && pwd)}
+# The scrubber program. Resolved without relying on $0, because this file is
+# sourced by the driver and by the self-tests from different directories, and
+# $0 then names whichever script is running rather than this file. The search
+# walks up from the current directory so both callers find it. A missing
+# scrubber is fatal to redaction, so it must be loud rather than silently
+# reduce every value to nothing.
+SP_SCRUB_AWK=""
+for _cand in \
+    "${SP_LIB_DIR:-}/scrub.awk" \
+    "${SP_LIB_DIR:-}/lib/scrub.awk" \
+    "./lib/scrub.awk" \
+    "./scrub.awk" \
+    "../lib/scrub.awk" \
+    "../sandprobe/lib/scrub.awk"
+do
+    [ -n "$_cand" ] || continue
+    if [ -f "$_cand" ]; then
+        SP_SCRUB_AWK="$_cand"
+        break
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Verdict vocabulary. Nothing outside this list may appear in a VERDICT field.
@@ -61,64 +82,115 @@ sp_set_report() {
 # Anything matched by neither rule is emitted verbatim.
 # ---------------------------------------------------------------------------
 
-# Names denoting a secret. Anchored on word boundaries via case globs so that
-# GIT_AUTHOR_NAME is not mistaken for an auth credential.
+# Credential redaction.
+#
+# The by-shape and by-name layers are implemented in lib/scrub.awk rather than
+# as one sed expression. Three sed shapes failed in ways recorded in that file:
+# a [_ -] class is a character RANGE that swallowed the separator, the GNU I
+# flag is not portable and conflicts with explicit case classes, and alternation
+# is leftmost-first so PASSWORD shadowed PASSPHRASE. In the awk version, gsub
+# returns a count rather than a string, so `line = gsub(...)` replaced every
+# line of the report with a number.
+#
+# The two pattern lists live here in the shell and travel in the environment,
+# because a value containing newlines does not survive awk -v intact.
+
+# Name fragments. A name is secret-bearing if it CONTAINS any of these, case
+# folded, which is what makes a compound such as AWS_SECRET_ACCESS_KEY match on
+# the SECRET inside it.
+SP_KW='token|secret|password|passwd|passphrase|api_key|api-key|apikey|access_key|secret_key|session_key|token_key|auth_token|access_token|id_token|bearer|client_secret|credential|credentials|license|encryption_key|signing_key|hmac|private_key'
+
+# Token shapes: documented credential formats, matched anywhere in the text.
+SP_SHAPES='gh[pousr]_[A-Za-z0-9]{16,}
+github_pat_[A-Za-z0-9_]{20,}
+glpat-[A-Za-z0-9_-]{16,}
+(AKIA|ASIA|AROA|AGPA)[A-Z0-9]{16}
+sk-ant-[A-Za-z0-9_-]{16,}
+sk-(proj-)?[A-Za-z0-9_-]{20,}
+sk_(live|test)_[A-Za-z0-9]{16,}
+(rk|pk)_(live|test)_[A-Za-z0-9]{16,}
+(xox[baprse]|xapp)-[A-Za-z0-9-]{10,}
+shpat_[A-Za-z0-9]{16,}
+hvs\.[A-Za-z0-9_-]{16,}
+AIza[A-Za-z0-9_-]{30,}
+ya29\.[A-Za-z0-9_-]{20,}
+npm_[A-Za-z0-9]{30,}
+hf_[A-Za-z0-9]{30,}
+r8_[A-Za-z0-9]{30,}
+dop_v1_[A-Za-z0-9]{30,}
+eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
+
+# Redact credential material in arbitrary text.
+#
+# A scrubber that fails must not look like a scrubber that found nothing. An
+# earlier version ended in 2>/dev/null, so a missing sed, or a sed without -E,
+# produced empty output and the caller wrote an empty report with exit 0. The
+# stderr is no longer discarded, and a non-zero status is surfaced so a broken
+# environment is diagnosable rather than silently lossy.
+sp_scrub() {
+    if [ ! -f "$SP_SCRUB_AWK" ]; then
+        printf 'sandprobe: credential scrubber missing at %s\n' "$SP_SCRUB_AWK" >&2
+        return 1
+    fi
+    SANDPROBE_KEYWORDS="$SP_KW" SANDPROBE_SHAPES="$SP_SHAPES" \
+        awk -f "$SP_SCRUB_AWK"
+}
+
+# Names denoting a secret, for the by-name layer on structured fields.
+# Case folded and matched as a substring, so a compound such as DB_PASSWORD is
+# recognised. GIT_AUTHOR_NAME and SSH_AUTH_SOCK are deliberately not caught:
+# neither holds a credential.
 sp_secret_name() {
-    case "$1" in
-        TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|\
-        CREDENTIAL|CREDENTIALS|AUTH_TOKEN|BEARER|SESSION_TOKEN|CLIENT_SECRET|\
-        SIGNING_KEY|ENCRYPTION_KEY|LICENSE_KEY|HMAC|SALT|\
-        *_TOKEN|*_TOKEN_*|*_SECRET|*_SECRET_*|*_PASSWORD|*_PASSWD|\
-        *_API_KEY|*_APIKEY|*_ACCESS_KEY|*_PRIVATE_KEY|*_CREDENTIAL|*_CREDENTIALS|\
-        *_AUTH_TOKEN|*_BEARER|*_SESSION_TOKEN|*_CLIENT_SECRET|*_SIGNING_KEY|\
-        *_ENCRYPTION_KEY|*_LICENSE_KEY|*_HMAC|*_SALT|\
-        *_TOKEN_|*_SECRET_|*_PASSWORD_|*_API_KEY_|*_CREDENTIAL_*)
+    case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+        *token*|*secret*|*password*|*passwd*|*passphrase*|*api_key*|*api-key*|*apikey*|\
+        *access_key*|*secret_key*|*session_key*|*auth_token*|*access_token*|*id_token*|\
+        *bearer*|*client_secret*|*credential*|*private_key*|*encryption_key*|*signing_key*)
             return 0 ;;
     esac
     return 1
 }
 
-# Redact token-shaped substrings in arbitrary text, stdin to stdout.
-# Each pattern below is a documented credential format. Narrow on purpose so
-# that ordinary hashes, UUIDs, addresses and prose are never touched.
-sp_scrub() {
-    sed -E \
-        -e 's/gh[pousr]_[A-Za-z0-9]{16,}/REDACTED/g' \
-        -e 's/github_pat_[A-Za-z0-9_]{20,}/REDACTED/g' \
-        -e 's/glpat-[A-Za-z0-9_-]{16,}/REDACTED/g' \
-        -e 's/(AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA|ABIA|ACCA)[A-Z0-9]{16}/REDACTED/g' \
-        -e 's/sk-ant-[A-Za-z0-9_-]{16,}/REDACTED/g' \
-        -e 's/sk-[A-Za-z0-9]{20,}/REDACTED/g' \
-        -e 's/xox[baprse]-[A-Za-z0-9-]{10,}/REDACTED/g' \
-        -e 's/AIza[A-Za-z0-9_-]{30,}/REDACTED/g' \
-        -e 's/ya29\.[A-Za-z0-9_-]{20,}/REDACTED/g' \
-        -e 's/npm_[A-Za-z0-9]{30,}/REDACTED/g' \
-        -e 's/hf_[A-Za-z0-9]{30,}/REDACTED/g' \
-        -e 's/r8_[A-Za-z0-9]{30,}/REDACTED/g' \
-        -e 's/dop_v1_[A-Za-z0-9]{30,}/REDACTED/g' \
-        -e 's/SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/REDACTED/g' \
-        -e 's/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/REDACTED/g' \
-        -e 's/([Aa]uthorization:[[:space:]]*(Bearer|Basic|Token|Digest)[[:space:]]+)[A-Za-z0-9._~+\/=-]{8,}/\1REDACTED/g' \
-        -e 's/(([Pp]assword|[Pp]asswd|[Ss]ecret|[Tt]oken|[Aa]pi[_-]?[Kk]ey|[Ss]ecret[_-]?[Kk]ey)[=:][[:space:]]*)[^[:space:]&;"'"'"']{6,}/\1REDACTED/g' \
-        2>/dev/null
-}
-
-# Scrub a PEM private key block, collapsing it to a marker.
+# Collapse a PEM private key block.
+#
+# The BEGIN marker is matched generically rather than as a fixed
+# "PRIVATE KEY" phrase, because real blocks are labelled RSA PRIVATE KEY,
+# EC PRIVATE KEY, OPENSSH PRIVATE KEY, ENCRYPTED PRIVATE KEY,
+# PGP PRIVATE KEY BLOCK, PGP SECRET KEY BLOCK and SSH2 ENCRYPTED PRIVATE KEY,
+# and a pattern admitting only letters and spaces between BEGIN and PRIVATE
+# matched some of those and missed the rest.
+#
+# The body is bounded to a line count. An unterminated BEGIN otherwise swallowed
+# everything to end of input, which once reduced a report by nine sections and
+# silently deleted its own verdict tally.
 sp_scrub_pem() {
     awk '
-        /-----BEGIN [A-Z ]*PRIVATE KEY-----/ {
-            inblock = 1
-            print "[REDACTED_PRIVATE_KEY]"
+        /^-----BEGIN [A-Z0-9 ]*(PRIVATE|SECRET) KEY( BLOCK)?-----/ {
+            if (!begun) print "[REDACTED_PRIVATE_KEY]"
+            begun = 1
+            n = 0
             next
         }
-        /-----END [A-Z ]*PRIVATE KEY-----/ { inblock = 0; next }
-        inblock { next }
+        /^-----END [A-Z0-9 ]*(PRIVATE|SECRET) KEY( BLOCK)?-----/ {
+            # A stray END without a BEGIN is real content, so keep it.
+            if (begun) begun = 0
+            else print
+            next
+        }
+        begun {
+            # Only a base64-shaped line continues a key body. An unterminated
+            # BEGIN otherwise consumed the rest of the document: a four-line
+            # input lost two lines, and a whole report lost its verdict tally
+            # and footer while still exiting 0.
+            if (length($0) <= 76 && $0 ~ /^[A-Za-z0-9+\/=]+$/) next
+            begun = 0
+            print "[REDACTED_PRIVATE_KEY: unterminated marker, body ends here]"
+            print
+            next
+        }
         { print }
     '
 }
 
-# Key/value line. Redacted wholesale when the key denotes a secret, otherwise
-# the value is scrubbed for embedded token shapes.
 # A key/value line. The value is flattened to a single line and its separators
 # neutralised before printing.
 #

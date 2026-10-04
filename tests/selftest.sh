@@ -191,9 +191,9 @@ check_equals "kernel release survives" "v = 6.1.0-18-amd64" "$(sp_kv 'v' '6.1.0-
 check_equals "40-char hex survives" "v = 0123456789abcdef0123456789abcdef01234567" "$(sp_kv 'v' '0123456789abcdef0123456789abcdef01234567')"
 
 printf '\nPEM private key block is collapsed\n'
-PEM=$(printf -- '-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\nSECRETDATA\n-----END RSA PRIVATE KEY-----\nafter' | sp_scrub_pem)
+PEM=$(printf -- '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAx\nMIIEowIBAAKCAQEAx\n-----END RSA PRIVATE KEY-----\nafter' | sp_scrub_pem)
 check_contains "pem begin replaced" "[REDACTED_PRIVATE_KEY]" "$PEM"
-check_not_contains "pem body gone" "SECRETDATA" "$PEM"
+check_not_contains "pem body gone" "MIIEowIBAAKCAQEAx" "$PEM"
 check_contains "text after pem survives" "after" "$PEM"
 
 printf '\nlive filesystem probes classify correctly\n'
@@ -401,6 +401,95 @@ printf '\nthe numeric uid is not treated as a user name\n'
 # which produced /home/0 and 135 records for paths no account owns.
 DIGITUSER=$(sed -e 's/#.*$//' "$SP_DIR/lib/discover.sh" 2>/dev/null | grep -cF '[!0-9]' || true)
 check_equals "discovery filters an all-digit user name" 1 "$DIGITUSER"
+
+
+printf '\ncredential shapes that previously leaked are redacted\n'
+# Every one of these was found by review to pass through sp_scrub verbatim.
+_leak_secrets() {
+    cat <<'LEAKEOF'
+password = hunter2xyz
+PASSWORD_FILE=/etc/shadow
+TOKEN = UpPeRcAsE0123456789
+token=abc123456789
+Token=x123456789
+api_key = SomeValueWithoutRecognisableShape
+api-key = x123456
+apikey = x123456789
+passphrase = aLongPassphrase123
+AWS_SECRET_ACCESS_KEY = wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY
+DB_PASSWORD: hunter2xyz
+USER_API_TOKEN = abc123456789
+session_token = abc123456789
+client_secret = abc123456789
+auth_token = abcdefghijklmnop
+access_token = abcdefghijklmnop
+password="quotedsecret123"
+https://user:password@host/path
+postgres://user:hunter2hunter2@db:5432/app
+mongodb+srv://user:password@host
+LEAKEOF
+}
+LEAKOUT=$(_leak_secrets | sp_scrub)
+check_equals "every input line still present" 20 "$(printf '%s\n' "$LEAKOUT" | grep -c .)"
+_n=$(printf '%s\n' "$LEAKOUT" | grep -c 'REDACTED')
+if [ "$_n" -ge 20 ]; then
+    ok "every key=value credential form is redacted ($_n markers)"
+else
+    bad "every key=value credential form is redacted" "only $_n markers for 20 inputs"
+fi
+check_not_contains "no bare password value survives" "hunter2xyz" "$LEAKOUT"
+check_not_contains "no aws secret value survives" "wJalrXUtnFEMIK7MDENG" "$LEAKOUT"
+check_not_contains "no url password survives" "user:password@" "$LEAKOUT"
+
+printf '\nprovider token formats are redacted\n'
+for _pfx in "ghp_" "github_pat_" "glpat-" "shpat_" "hvs." "dop_v1_" "npm_" "hf_" "r8_"; do
+    _v="${_pfx}$(printf 'abcdefghijklmnopqrstuvwxyz0123456789')"
+    check_equals "prefix $_pfx is redacted" "v = REDACTED" "$(sp_kv 'v' "$_v")"
+done
+check_equals "aws AKIA key is redacted" "v = REDACTED" "$(sp_kv 'v' "$(printf 'AKIA%s' 'ABCDEFGHIJKLMNOP')")"
+check_equals "google api key is redacted" "v = REDACTED" "$(sp_kv 'v' "$(printf 'AIza%s' 'SyA1234567890abcdefghijklmnopqrstuv')")"
+check_equals "openai project key is redacted" "v = REDACTED" "$(sp_kv 'v' "$(printf 'sk-proj-%s' 'abcdefghijklmnopqrstuvwx')")"
+check_equals "stripe live key is redacted" "v = REDACTED" "$(sp_kv 'v' "$(printf 'sk_live_%s' 'abcdefghijklmnopqrstuvwx')")"
+
+printf '\nheaders carrying credentials are redacted\n'
+_H1=$(printf 'Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l' | sp_scrub)
+check_not_contains "authorization basic value gone" "YWxhZGRpbjpvcGVuc2VzYW1l" "$_H1"
+_H2=$(printf 'Cookie: session=abcdefghijklmnopqrst' | sp_scrub)
+check_not_contains "cookie value gone" "abcdefghijklmnopqrst" "$_H2"
+
+printf '\nPEM private key blocks of every real label are collapsed\n'
+for _lbl in "RSA PRIVATE KEY" "PRIVATE KEY" "EC PRIVATE KEY" "OPENSSH PRIVATE KEY" \
+            "ENCRYPTED PRIVATE KEY" "PGP PRIVATE KEY BLOCK" "PGP SECRET KEY BLOCK" \
+            "SSH2 ENCRYPTED PRIVATE KEY" "DSA PRIVATE KEY"; do
+    _p=$(printf -- "-----BEGIN %s-----\nSECRETBODY\n-----END %s-----\nafter\n" "$_lbl" "$_lbl" | sp_scrub_pem)
+    check_not_contains "label '$_lbl' body removed" "SECRETBODY" "$_p"
+    check_contains "label '$_lbl' collapsed to marker" "[REDACTED_PRIVATE_KEY]" "$_p"
+    check_contains "label '$_lbl' text after survives" "after" "$_p"
+done
+
+printf '\nPEM blocks that are not secret are preserved\n'
+for _lbl in "PUBLIC KEY" "CERTIFICATE" "PGP MESSAGE" "PGP SIGNATURE"; do
+    _p=$(printf -- "-----BEGIN %s-----\nBODY\n-----END %s-----\n" "$_lbl" "$_lbl" | sp_scrub_pem)
+    check_contains "label '$_lbl' preserved" "BODY" "$_p"
+done
+
+printf '\nan unterminated PEM marker cannot swallow the document\n'
+UNTERM=$(printf 'first line\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAx\nlast line\n' | sp_scrub_pem)
+check_contains "text before survives" "first line" "$UNTERM"
+check_contains "text after an unterminated marker survives" "last line" "$UNTERM"
+
+printf '\nthe scrubber is found and fails loudly when missing\n'
+if [ -n "${SP_SCRUB_AWK:-}" ] && [ -f "$SP_SCRUB_AWK" ]; then
+    ok "scrubber resolved to $SP_SCRUB_AWK"
+else
+    bad "scrubber resolved" "SP_SCRUB_AWK=[${SP_SCRUB_AWK:-unset}] is not a file"
+fi
+# core.sh resolves SP_SCRUB_AWK at source time, so the value is set again after
+# sourcing; a leading -v would be read by sh as an option.
+MISSING=$(sh -c '. "$1"; SP_SCRUB_AWK=/nonexistent/nope; printf "x=1\n" | sp_scrub >/dev/null' sh "$SP_DIR/lib/core.sh" 2>&1)
+check_contains "missing scrubber is reported" "scrubber missing" "$MISSING"
+MISSRC=$(sh -c '. "$1"; SP_SCRUB_AWK=/nonexistent/nope; printf "x=1\n" | sp_scrub; echo rc=$?' sh "$SP_DIR/lib/core.sh" 2>&1)
+check_contains "missing scrubber exits non-zero" "rc=1" "$MISSRC"
 
 printf '\nno hardcoded host identity in the library\n'
 # A username, session id or project path baked into the probe would make the

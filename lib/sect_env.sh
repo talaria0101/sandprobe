@@ -49,17 +49,17 @@ sp_section_env() {
 
     printf '\n## TOKEN SHAPES PRESENT IN ENVIRONMENT\n\n'
     sp_raw "# Presence only. This proves the redaction layer has work to do and"
-    sp_raw "# that the layer did it, without disclosing any value."
-    _hits=$(env 2>/dev/null | sed -n 's/^[A-Za-z_][A-Za-z0-9_]*=//p' | grep -oE \
-        'gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|sk-ant-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{20,}|xox[baprse]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{30,}|ya29\.[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{30,}|hf_[A-Za-z0-9]{30,}|r8_[A-Za-z0-9]{30,}|dop_v1_[A-Za-z0-9]{30,}|SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' \
-        2>/dev/null | sed -E 's/^(gh[pousr]|github_pat|glpat|AKIA|sk|xox|AIza|ya29|npm|hf|r8|dop_v1|SG|eyJ).*/\1.../' | LC_ALL=C sort -u)
-    if [ -n "$_hits" ]; then
-        printf '%s\n' "$_hits" | while IFS= read -r h; do
-            sp_kv "token_shape_present" "$h"
-        done
-    else
-        sp_raw "# no recognised credential token shape found in environment values"
-    fi
+    sp_raw "# that the layer did it, without disclosing any value. The list is"
+    sp_raw "# derived from the scrubber's own patterns, so it cannot disagree"
+    sp_raw "# with what is actually redacted."
+    printf '%s\n' "$SP_SHAPES" | awk 'NF && $0 !~ /^#/ { print }' | while IFS= read -r pat; do
+        _n=$(env 2>/dev/null | sed -n 's/^[A-Za-z_][A-Za-z0-9_]*=//p' \
+             | grep -oE "$pat" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${_n:-0}" -gt 0 ]; then
+            # head -c, not cut -c: a per-line cut does not bound the stream.
+            sp_kv "token_shape_present" "$_n occurrence(s) of $(printf '%s' "$pat" | head -c 48)"
+        fi
+    done
 
     printf '\n## ARGV AND PARENT CHAIN\n\n'
     sp_kv "self_argv" "$(tr '\0' ' ' < "/proc/$$/cmdline" 2>/dev/null)"

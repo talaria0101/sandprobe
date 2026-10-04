@@ -76,11 +76,24 @@ sp_section_fs() {
 
     printf '\n## FILE READ MATRIX\n\n'
     for f in $SP_CANDIDATE_FILES; do
-        _err=$(timeout "$SP_BUDGET" sh -c "head -c 1 '$f' >/dev/null" 2>&1)
         if [ ! -e "$f" ]; then
             sp_rec "$SP_CUR" "read:$f" "ABSENT" "not present on this host"
-        elif [ -z "$_err" ]; then
+            continue
+        fi
+        # Directories are not readable as a byte stream. Probing one produced
+        # "Is a directory", which matched no classification and reported
+        # UNKNOWN for something whose answer is plainly not unknown.
+        if [ -d "$f" ]; then
+            sp_rec "$SP_CUR" "read:$f" "ABSENT" \
+                "is a directory; the directory read matrix above is the measurement that applies"
+            continue
+        fi
+        _err=$(timeout "$SP_BUDGET" sh -c "head -c 1 '$f' >/dev/null" 2>&1)
+        _rc=$?
+        if [ -z "$_err" ] && [ "$_rc" -eq 0 ]; then
             sp_rec "$SP_CUR" "read:$f" "ALLOW" "first byte readable"
+        elif [ "$_rc" -eq 124 ]; then
+            sp_rec "$SP_CUR" "read:$f" "TIMEOUT" "no byte available within ${SP_BUDGET}s"
         else
             sp_rec "$SP_CUR" "read:$f" "$(sp_verdict_from_err "$_err")" "$_err"
         fi
@@ -95,6 +108,12 @@ sp_section_fs() {
         _perm=$(stat -c '%A %U:%G' "$d" 2>/dev/null)
         # Read one byte; proves the node is genuinely openable rather than
         # merely statable.
+        # A directory in the device list is not readable as a byte stream.
+        if [ -d "$d" ]; then
+            sp_rec "$SP_CUR" "read:$d" "ABSENT" \
+                "is a directory; directory access is measured by the directory matrices"
+            continue
+        fi
         # Character devices may block with no data available: /dev/tty waits
         # forever when there is no controlling terminal, and a fifo waits for
         # a writer. A read with no budget is a hang, so every device read is
@@ -145,18 +164,74 @@ sp_section_fs() {
     sp_kv "tmp_size_bytes" "$(df -B1 "${TMPDIR:-/tmp}" 2>/dev/null | awk 'NR==2{print $2}' || echo UNREADABLE)"
 
     printf '\n## FILE DESCRIPTOR STATE\n\n'
-    sp_kv "open_fds" "$(ls /proc/self/fd 2>/dev/null | wc -l | tr -d ' ')"
-    sp_kv "fd_targets" "$(ls -l /proc/self/fd 2>/dev/null | sed 's/.*-> //' | sort | tr '\n' ' ')"
-    sp_kv "fd_soft_limit" "$(awk '/Max open files/{print $4}' /proc/self/limits 2>/dev/null)"
-    sp_kv "fd_hard_limit" "$(awk '/Max open files/{print $5}' /proc/self/limits 2>/dev/null)"
-    # Prove the soft limit is real rather than quoted.
+    sp_kv "open_fds" "$(ls "/proc/$$/fd" 2>/dev/null | wc -l | tr -d ' ')"
+    sp_kv "fd_targets" "$(ls -l "/proc/$$/fd" 2>/dev/null | sed 's/.*-> //' | sort | tr '\n' ' ')"
+    sp_kv "fd_soft_limit" "$(awk '/Max open files/{print $4}' /proc/$$/limits 2>/dev/null)"
+    sp_kv "fd_hard_limit" "$(awk '/Max open files/{print $5}' /proc/$$/limits 2>/dev/null)"
+    # The value the shell itself reports, for comparison with the empirical
+    # count below. The empirical count does not depend on it.
     _n=$(sh -c 'ulimit -n' 2>/dev/null)
-    sp_kv "ulimit_n_reported" "$_n"
-    _err=$(timeout 30 sh -c 'i=0; while [ $i -lt 5000 ]; do eval "exec $i</dev/null" 2>/dev/null || break; i=$((i+1)); done; echo $i' 2>&1)
-    sp_kv "fd_empirical_max" "$_err"
-    sp_rec "$SP_CUR" "fd_soft_limit_reaches_limit" \
-        "$( [ "${_err:-0}" -ge 400 ] 2>/dev/null && echo ALLOW || echo UNKNOWN )" \
-        "empirically opened $_err descriptors before refusal (soft limit $_n)"
+    sp_kv "ulimit_n_reported" "${_n:-unknown}"
+
+    # Confirm the soft limit by exhausting it, rather than quoting it.
+    #
+    # The portable way to do this is a loop of redirections, but the obvious
+    # shell forms are not portable in the way they look:
+    #
+    #   exec $i</dev/null inside eval   dash parses the number as a command
+    #                                    name and exits 127; bash opens the fd
+    #   the same loop with exec {fd}    dash aborts
+    #   the same loop under a subshell  dash opens 1 descriptor and stops,
+    #                                    bash opens 1015
+    #
+    # So the count comes from a language whose descriptor semantics are
+    # defined, and when that is unavailable the verdict is UNKNOWN rather than
+    # a number that would differ by three orders of magnitude between shells.
+    _fdmax="unknown"
+    _fderrno=""
+    if command -v python3 >/dev/null 2>&1; then
+        _fdout=$(timeout 60 python3 - <<'PYFDPROBE' 2>/dev/null
+import os, resource, errno
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+fds, opened = [], 0
+err = None
+try:
+    for _ in range(soft + 16):
+        fds.append(os.open(os.devnull, os.O_RDONLY))
+        opened += 1
+except OSError as exc:
+    err = exc.errno
+finally:
+    for f in fds:
+        try:
+            os.close(f)
+        except OSError:
+            pass
+print("opened=%d soft=%d hard=%d errno=%s" % (
+    opened, soft, hard, errno.errorcode.get(err, "none")))
+PYFDPROBE
+)
+        case "$_fdout" in
+            *opened=*)
+                _fdmax=$(printf '%s' "$_fdout" | sed -n 's/.*opened=\([0-9]*\).*/\1/p')
+                _fderrno=$(printf '%s' "$_fdout" | sed -n 's/.*errno=\([A-Za-z]*\).*/\1/p')
+                ;;
+        esac
+    fi
+    sp_kv "fd_empirical_max_opened" "$_fdmax"
+    sp_kv "fd_refused_with_errno" "${_fderrno:-not-measured}"
+    sp_kv "fd_soft_limit_reported" "$_n"
+    sp_kv "fd_hard_limit_reported" "$(awk '/Max open files/{print $5}' "/proc/$$/limits" 2>/dev/null)"
+    if [ "$_fdmax" = "unknown" ]; then
+        sp_rec "$SP_CUR" "fd_soft_limit_empirically_confirmed" "UNKNOWN" \
+            "no portable way to exhaust descriptors on this host; the reported soft limit $_n is quoted from /proc/$$/limits and was NOT confirmed empirically. Shell-only probes were rejected because dash and bash disagree by three orders of magnitude on the same loop."
+    elif [ "$_fdmax" -ge 100 ]; then
+        sp_rec "$SP_CUR" "fd_soft_limit_empirically_confirmed" "ALLOW" \
+            "opened $_fdmax descriptors before refusal with $_fderrno, against a quoted soft limit of $_n"
+    else
+        sp_rec "$SP_CUR" "fd_soft_limit_empirically_confirmed" "DENY" \
+            "only $_fdmax descriptors could be opened, well below the quoted soft limit of $_n"
+    fi
 
     printf '\n## LARGE FILE AND SPARSE FILE BEHAVIOUR\n\n'
     _err=$(timeout 60 sh -c "dd if=/dev/zero of='${TMPDIR:-/tmp}/.sandprobe-100m' bs=1M count=100 2>&1 | tail -1")

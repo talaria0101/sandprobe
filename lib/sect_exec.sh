@@ -191,10 +191,10 @@ sp_section_exec() {
     sp_kv "ld_so_preload_from_etc" "$(cat /etc/ld.so.preload 2>/dev/null || echo 'no /etc/ld.so.preload')"
 
     printf '\n## EXECUTE-BIT AND SETUID SURFACE\n\n'
-    sp_kv "nosuid_mounts" "$(grep 'nosuid' /proc/self/mounts 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
-    sp_kv "noexec_mounts" "$(grep 'noexec' /proc/self/mounts 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
-    sp_kv "nodev_mounts" "$(grep 'nodev' /proc/self/mounts 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
-    sp_kv "no_new_privs" "$(awk '/^NoNewPrivs/{print $2}' /proc/self/status 2>/dev/null)"
+    sp_kv "nosuid_mounts" "$(grep 'nosuid' /proc/$$/mounts 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+    sp_kv "noexec_mounts" "$(grep 'noexec' /proc/$$/mounts 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+    sp_kv "nodev_mounts" "$(grep 'nodev' /proc/$$/mounts 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+    sp_kv "no_new_privs" "$(awk '/^NoNewPrivs/{print $2}' /proc/$$/status 2>/dev/null)"
     sp_kv "setuid_binaries_count" "$(timeout 30 find /usr/bin /usr/sbin /bin /sbin -xdev -perm -4000 2>/dev/null | wc -l | tr -d ' ')"
     sp_kv "setgid_binaries_count" "$(timeout 30 find /usr/bin /usr/sbin /bin /sbin -xdev -perm -2000 2>/dev/null | wc -l | tr -d ' ')"
     sp_raw "# setuid and setgid binaries, by name:"
@@ -202,7 +202,7 @@ sp_section_exec() {
     # A setuid binary with NoNewPrivs=1 cannot gain privilege. Confirm the
     # kernel agrees rather than asserting it.
     sp_kv "no_new_privs_means_setuid_inert" \
-        "$([ "$(awk '/^NoNewPrivs/{print $2}' /proc/self/status 2>/dev/null)" = "1" ] && echo 'yes, per NoNewPrivs=1' || echo 'no, NoNewPrivs is not 1')"
+        "$([ "$(awk '/^NoNewPrivs/{print $2}' /proc/$$/status 2>/dev/null)" = "1" ] && echo 'yes, per NoNewPrivs=1' || echo 'no, NoNewPrivs is not 1')"
 
     printf '\n## WRITE+EXECUTE ON THE SAME FILESYSTEM\n\n'
     sp_raw "# The classic escape is writing an executable where execution is allowed."

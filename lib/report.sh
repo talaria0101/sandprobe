@@ -46,3 +46,49 @@ sp_emit_footer() {
     sp_kv "probe_elapsed_seconds" "$SP_ELAPSED"
     printf '%s\n' "$_rule"
 }
+
+# Verdict tally over the assembled report body.
+#
+# A report of several thousand lines is not actionable on its own, so the
+# counts are summarised. The summary states its own limits: it counts records,
+# it does not weigh them, and UNKNOWN is called out separately precisely
+# because it is where the report's own uncertainty lives.
+sp_emit_summary() {
+    _body="$SP_WORK/report.body"
+    [ -r "$_body" ] || return 0
+    printf '\n## VERDICT TALLY\n\n'
+    printf '%s\n' "# Counts of structured records by verdict. This is a count of"
+    printf '%s\n' "# records, not a risk assessment: one DENY and one ALLOW are not"
+    printf '%s\n' "# comparable in importance. UNKNOWN is listed because that is where"
+    printf '%s\n' "# this report's own uncertainty lives."
+
+    awk -F'\t' '
+        $1 ~ /^(discover|host|security|fs|env|net|exec|escalation|escape-surface|procfs|procfs-traverse|device|credsfile|config|loopback|routes|tool)$/ {
+            seen[$3]++
+        }
+        END {
+            n = 0
+            for (k in seen) { printf "  %-12s %d\n", k, seen[k]; n += seen[k] }
+            printf "  %-12s %d\n", "TOTAL", n
+        }
+    ' "$_body" | LC_ALL=C sort
+
+    printf '\n%s\n' "# UNKNOWN records, in full. These are the questions this run could not"
+    printf '%s\n' "# answer, and they are the first place to look if the report is"
+    printf '%s\n' "# incomplete."
+    awk -F'\t' '$3 == "UNKNOWN" { printf "  %s :: %s :: %s\n", $1, $2, $4 }' "$_body" | head -60
+
+    printf '\n%s\n' "# DENY records under the escalation and escape-surface sections, which are"
+    printf '%s\n' "# the security-relevant refusals."
+    awk -F'\t' \
+        '($1 == "escalation" || $1 == "escape-surface" || $1 == "procfs-traverse") && $3 == "DENY" {
+            printf "  %s :: %s\n", $2, substr($4, 1, 110)
+         }' "$_body" | head -60
+
+    printf '\n%s\n' "# ALLOW records under those same sections, because an unexpected"
+    printf '%s\n' "# ALLOW is as interesting as an unexpected DENY."
+    awk -F'\t' \
+        '($1 == "escalation" || $1 == "escape-surface" || $1 == "procfs-traverse") && $3 == "ALLOW" {
+            printf "  %s :: %s\n", $2, substr($4, 1, 110)
+         }' "$_body" | head -60
+}

@@ -178,7 +178,8 @@ sp_verdict_from_err() {
             printf 'TIMEOUT' ;;
         *"too many open files"*|*"cannot allocate memory"*|*"out of memory"*|\
         *"no space left on device"*|*"text file busy"*|*"resource busy"*|\
-        *"too many processes"*|*"quota exceeded"*)
+        *"too many processes"*|*"quota exceeded"*|*"i/o error"*|*"input/output error"*|\
+        *"no space left"*)
             # Exhaustion, not policy. Calling these DENY would blame a
             # sandbox boundary for a full disk or an open file limit.
             printf 'EXHAUSTED' ;;

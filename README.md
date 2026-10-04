@@ -166,7 +166,7 @@ code follows because ignoring any of them breaks a real shell:
 ./tests/selftest.sh
 ```
 
-111 checks covering verdict classification, redaction and non-redaction,
+126 checks covering verdict classification, redaction and non-redaction,
 variable-collision resistance, path trimming, live filesystem probes, closed
 vocabulary, source hygiene, and syntax of every file.
 

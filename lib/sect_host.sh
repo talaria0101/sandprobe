@@ -45,7 +45,7 @@ sp_section_host() {
         sp_kv "nproc_affinity" "$(nproc --all 2>/dev/null)"
         sp_kv "cpu_online" "$(cat /sys/devices/system/cpu/online 2>/dev/null || echo UNREADABLE)"
     fi
-    sp_kv "Cpus_allowed_list" "$(awk '/^Cpus_allowed_list/{print $2}' /proc/self/status 2>/dev/null)"
+    sp_kv "Cpus_allowed_list" "$(awk '/^Cpus_allowed_list/{print $2}' /proc/$$/status 2>/dev/null)"
 
     printf '\n## MEMORY\n\n'
     if [ -r /proc/meminfo ]; then
@@ -65,7 +65,7 @@ EOF
     sp_kv "pressure_io" "$(cat /proc/pressure/io 2>/dev/null || echo ABSENT)"
 
     printf '\n## CGROUP LIMITS\n\n'
-    sp_kv "self_cgroup" "$(cat /proc/self/cgroup 2>/dev/null | tr '\n' ' ')"
+    sp_kv "self_cgroup" "$(cat "/proc/$$/cgroup" 2>/dev/null | tr '\n' ' ')"
     if [ -d /sys/fs/cgroup ]; then
         sp_kv "cgroup_version" "v2 unified at /sys/fs/cgroup"
         sp_kv "cgroup_cpu_max" "$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo UNSET)"
@@ -79,11 +79,11 @@ EOF
     fi
 
     printf '\n## RLIMIT OF THE PROBING PROCESS\n\n'
-    if [ -r /proc/self/limits ]; then
+    if [ -r /proc/$$/limits ]; then
         sp_raw "# each row: limit soft hard unit"
-        cat /proc/self/limits 2>/dev/null | sp_scrub
+        cat /proc/$$/limits 2>/dev/null | sp_scrub
     else
-        sp_rec "host" "rlimits" "UNKNOWN" "/proc/self/limits unreadable"
+        sp_rec "host" "rlimits" "UNKNOWN" "/proc/$$/limits unreadable"
     fi
-    sp_kv "umask" "$(awk '/^Umask/{print $2}' /proc/self/status 2>/dev/null)"
+    sp_kv "umask" "$(awk '/^Umask/{print $2}' /proc/$$/status 2>/dev/null)"
 }

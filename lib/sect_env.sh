@@ -23,9 +23,9 @@ sp_section_env() {
                 *)   sp_raw "$line" ;;
             esac
         done
-    elif [ -r /proc/self/environ ]; then
+    elif [ -r "/proc/$$/environ" ]; then
         sp_rec "$SP_CUR" "env_source" "UNKNOWN" "env(1) absent; fell back to /proc/self/environ"
-        tr '\0' '\n' < /proc/self/environ 2>/dev/null | LC_ALL=C sort | while IFS= read -r line; do
+        tr '\0' '\n' < "/proc/$$/environ" 2>/dev/null | LC_ALL=C sort | while IFS= read -r line; do
             _name=${line%%=*}
             case "$line" in
                 *=*) sp_kv "$_name" "${line#*=}" ;;
@@ -62,20 +62,35 @@ sp_section_env() {
     fi
 
     printf '\n## ARGV AND PARENT CHAIN\n\n'
-    sp_kv "self_argv" "$(tr '\0' ' ' < /proc/self/cmdline 2>/dev/null)"
-    # pid 1 is often a supervisor carrying tens of kilobytes of prompt text.
-    # Inlining that into a report is noise, so record the executable, the
-    # argument count, the total size and a bounded prefix. Nothing is hidden:
-    # the size is reported so a reader knows what was elided.
+    sp_kv "self_argv" "$(tr '\0' ' ' < "/proc/$$/cmdline" 2>/dev/null)"
+    # pid 1 is often a supervisor carrying a very large argument vector.
+    #
+    # Truncation is on the byte stream, not per line. `cut -c1-300` applies to
+    # each line independently, and because NUL-to-space conversion turns this
+    # cmdline into many lines, an earlier version emitted 12,089 bytes from a
+    # "300 character" limit and inlined the supervisor's whole prompt into a
+    # report intended to be shared.
+    #
+    # head -c bounds the input before any conversion, so the result is
+    # genuinely bounded. The total size is reported alongside, so nothing is
+    # hidden, only not inlined.
     sp_kv "pid1_executable" "$(tr '\0' '\n' < /proc/1/cmdline 2>/dev/null | head -1 || echo UNREADABLE)"
     sp_kv "pid1_argc" "$(tr '\0' '\n' < /proc/1/cmdline 2>/dev/null | grep -c . || echo UNREADABLE)"
-    sp_kv "pid1_bytes" "$(wc -c < /proc/1/cmdline 2>/dev/null | tr -d ' ' || echo UNREADABLE)"
-    sp_kv "pid1_prefix" "$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | cut -c1-300 || echo UNREADABLE)"
+    sp_kv "pid1_argv_bytes" "$(wc -c < /proc/1/cmdline 2>/dev/null | tr -d ' ' || echo UNREADABLE)"
+    sp_kv "pid1_argv_prefix_120b" "$(head -c 120 /proc/1/cmdline 2>/dev/null | tr '\0' ' ' || echo UNREADABLE)"
+    sp_kv "pid1_argv_truncated" "$(
+        _tot=$(wc -c < /proc/1/cmdline 2>/dev/null | tr -d ' ')
+        if [ -n "$_tot" ] && [ "$_tot" -gt 120 ]; then
+            printf 'yes: %s bytes of argv, 120 inlined; the remainder is deliberately not copied into the report\n' "$_tot"
+        else
+            printf 'no: argv is %s bytes\n' "${_tot:-unknown}"
+        fi
+    )"
     sp_kv "pid1_exe" "$(readlink /proc/1/exe 2>/dev/null || echo UNREADABLE)"
-    sp_kv "self_exe" "$(readlink /proc/self/exe 2>/dev/null || echo UNREADABLE)"
-    sp_kv "self_cwd" "$(readlink /proc/self/cwd 2>/dev/null || echo UNREADABLE)"
+    sp_kv "self_exe" "$(readlink "/proc/$$/exe" 2>/dev/null || echo UNREADABLE)"
+    sp_kv "self_cwd" "$(readlink "/proc/$$/cwd" 2>/dev/null || echo UNREADABLE)"
     sp_kv "pid1_cwd" "$(readlink /proc/1/cwd 2>/dev/null || echo UNREADABLE)"
-    sp_kv "ppid_comm" "$(cat "/proc/$(awk '/^PPid/{print $2}' /proc/self/status 2>/dev/null)/comm" 2>/dev/null || echo UNREADABLE)"
+    sp_kv "ppid_comm" "$(cat "/proc/$(awk '/^PPid/{print $2}' /proc/$$/status 2>/dev/null)/comm" 2>/dev/null || echo UNREADABLE)"
     # Walk the ancestry, bounded, so a host-side supervisor chain is visible
     # when it is visible at all.
     _p=$$

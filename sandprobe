@@ -34,6 +34,8 @@ export SP_LIB_DIR="$SP_SELF_DIR/lib"
 . "$SP_SELF_DIR/lib/discover.sh"
 # shellcheck source=lib/execdir.sh
 . "$SP_SELF_DIR/lib/execdir.sh"
+# shellcheck source=lib/security_helpers.sh
+. "$SP_SELF_DIR/lib/security_helpers.sh"
 # shellcheck source=lib/sect_host.sh
 . "$SP_SELF_DIR/lib/sect_host.sh"
 # shellcheck source=lib/sect_security.sh
@@ -174,6 +176,7 @@ wanted net      && { note "probing network";  sp_section_net; }
 wanted exec     && { note "probing executables"; sp_section_exec; }
 
 SP_ELAPSED=$(( $(date '+%s' 2>/dev/null || echo 0) - SP_T0 ))
+sp_emit_summary
 sp_emit_footer
 
 exec 1>&3 3>&-

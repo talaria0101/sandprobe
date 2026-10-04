@@ -248,7 +248,14 @@ sp_section_discover() {
     sp_kv "user_env" "${USER:-UNSET}"
     sp_kv "logname_env" "${LOGNAME:-UNSET}"
     sp_kv "id_un" "$(id -un 2>&1)"
-    sp_kv "mountinfo_readable" "$([ -r /proc/self/mountinfo ] && echo yes || echo no)"
+    # Reflects whether the parsed copy exists, which is the same fact this
+    # section went on to use. Reading /proc/self/mountinfo here would test the
+    # substituted child's procfs rather than this process's.
+    if [ -s "$SP_WORK/mountinfo.parsed" ]; then
+        sp_kv "mountinfo_readable" "yes"
+    else
+        sp_kv "mountinfo_readable" "no"
+    fi
     sp_kv "mount_records" "$(printf '%s\n' "$SP_MOUNT_RECORDS" | grep -c . 2>/dev/null)"
     sp_kv "users_discovered" "$(printf '%s\n' "$SP_CANDIDATE_USERS" | grep -c . 2>/dev/null)"
     sp_kv "homes_discovered" "$(printf '%s\n' "$SP_CANDIDATE_HOMES" | grep -c . 2>/dev/null)"

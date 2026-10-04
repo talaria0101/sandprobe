@@ -282,6 +282,70 @@ for wf_path in sandprobe tests/selftest.sh lib/netprobe.py README.md LICENSE; do
 done
 check_equals "every path referenced by CI exists" 0 "$WF_MISSING"
 
+
+printf '\nescalation probes repeat no command name\n'
+# A call of the form sp_esc "label" sh sh -c ... executes argv [sh, sh, -c, SCRIPT].
+# dash reads argv[1] as the script to run, so the payload never executes and the
+# empty output classified as ALLOW. 20 probes were affected.
+DOUBLED=$(grep -oE 'sp_esc "[^"]*"[[:space:]]+([A-Za-z0-9_./-]+)[[:space:]]+\1[[:space:]]' \
+        "$SP_DIR"/lib/sect_security.sh 2>/dev/null | wc -l | tr -d ' ')
+check_equals "no sp_esc call repeats its command name" 0 "$DOUBLED"
+
+printf '\nno line continuation is a double backslash\n'
+# "\\\\" at end of line is an escaped backslash, not a continuation. The shell
+# ends the command there and runs the next line as a separate command, which
+# produced records with empty targets and leaked shell errors to stderr.
+DBLSLASH=$(grep -c '\\\\$' "$SP_DIR"/lib/*.sh 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+check_equals "no double-backslash line continuations" 0 "$DBLSLASH"
+
+printf '\nno emission loop is fed by a pipe\n'
+# A while loop fed by a pipe runs in a subshell. Any sp_rec or sp_kv inside it
+# writes to a copy of stdout that is discarded, so records vanish while the
+# report looks as though it has them.
+PIPEDLOOP=$(grep -nE '\|[[:space:]]*while[[:space:]]+(IFS=)?read' "$SP_DIR"/lib/sect_*.sh 2>/dev/null | wc -l | tr -d ' ')
+check_equals "no pipe into an emitting while loop" 0 "$PIPEDLOOP"
+
+printf '\nno /proc/self inside a command substitution\n'
+# /proc/self inside $( ) names the substituted child, so the field describes a
+# cat or an awk rather than the probing process. It made ppid equal pid.
+# Comments are excluded by stripping everything after an unquoted #, and
+# /proc/self/root is excluded because it is a symlink: /proc/self and /proc/$$
+# resolve to the same inode, so the substitution makes no difference there.
+SELFSUB=0
+for f in "$SP_DIR"/lib/*.sh; do
+    n=$(sed -e 's/#.*$//' "$f" 2>/dev/null \
+        | grep -cE '\$\(.*/proc/self/(mountinfo|status|limits|mounts|environ|f|cgroup|uid_map|gid_map|setgroups|ns/)' )
+    SELFSUB=$((SELFSUB + n))
+done
+check_equals "no /proc/self inside a substitution" 0 "$SELFSUB"
+# A redirection target inside $( ) has the same problem.
+SELFred=$(grep -nE '\$\(.*<[[:space:]]*"?/proc/self' "$SP_DIR"/lib/*.sh 2>/dev/null | wc -l | tr -d ' ')
+check_equals "no /proc/self as a substitution input" 0 "$SELFred"
+
+printf '\ntruncation bounds the whole stream, not each line\n'
+# cut -c1-N applies per line. Because a cmdline becomes many lines after
+# NUL-to-space conversion, a "300 character" prefix emitted 12,089 bytes and
+# inlined a supervisor prompt into a report meant to be shared.
+# Comments excluded: the explanation of why per-line cut was removed mentions
+# cut -c1-300.
+PERCUTCUT=$(grep -vE '^[[:space:]]*#' "$SP_DIR"/lib/*.sh "$SP_DIR"/sandprobe 2>/dev/null \
+        | grep -cE 'cut -c[0-9]+')
+check_equals "no per-line cut truncation" 0 "$PERCUTCUT"
+
+printf '\nno field is emitted with an empty target\n'
+# A record whose id is empty cannot be acted on. This is the signature of a
+# mangled multi-line command.
+EMPTYID=$(grep -oE 'sp_rec "\$SP_CUR" ""|sp_rec "" ' "$SP_DIR"/lib/*.sh 2>/dev/null | wc -l | tr -d ' ')
+check_equals "no sp_rec with a literal empty target" 0 "$EMPTYID"
+
+printf '\nthe report has a verdict tally\n'
+if [ -f "$SP_DIR/lib/report.sh" ]; then
+    check_contains "summary function exists" "sp_emit_summary" \
+        "$(cat "$SP_DIR/lib/report.sh")"
+fi
+DRV=$(cat "$SP_DIR/sandprobe")
+check_contains "driver calls the summary" "sp_emit_summary" "$DRV"
+
 printf '\nno hardcoded host identity in the library\n'
 # A username, session id or project path baked into the probe would make the
 # report wrong on any other host.

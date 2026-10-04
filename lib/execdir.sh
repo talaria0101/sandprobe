@@ -77,9 +77,20 @@ sp_compile_run() {
         sp_rec "$SP_CUR" "$__cr_label" "UNKNOWN" "could not create a build directory under $SP_EXEC_DIR"
         return 0
     fi
+    # Every path out of this function removes the build directory. It used to
+    # be removed once, at the end, so the early return above this point for a
+    # failed compile left $SP_EXEC_DIR/sandprobe-build.$$ behind, and since
+    # sp_find_exec_dir prefers the cwd over the temp root that residue landed
+    # inside the repository being probed. The cleanup is a function so that no
+    # future exit can forget it.
+    __cr_cleanup() {
+        rm -rf "$__cr_dir" 2>/dev/null
+        return 0
+    }
     "$@" -o "$__cr_dir/prog" 2>"$__cr_dir/err" || true
     if [ ! -f "$__cr_dir/prog" ]; then
         __cr_msg=$(head -2 "$__cr_dir/err" 2>/dev/null | tr '\n' ' ')
+        __cr_cleanup
         sp_rec "$SP_CUR" "$__cr_label" "$(sp_verdict_from_err "$__cr_msg")" \
             "compile failed: ${__cr_msg:-no diagnostic}"
         return 0
@@ -87,15 +98,17 @@ sp_compile_run() {
     __cr_out=$(timeout 20 "$__cr_dir/prog" 2>&1)
     __cr_rc=$?
     if [ "$__cr_rc" -eq 0 ]; then
+        __cr_cleanup
         sp_rec "$SP_CUR" "$__cr_label" "ALLOW" \
             "compiled in $SP_EXEC_DIR and the binary ran (exit 0${__cr_out:+: $__cr_out})"
     elif [ "$__cr_rc" -eq 126 ] || [ "$__cr_rc" -eq 127 ]; then
+        __cr_cleanup
         sp_rec "$SP_CUR" "$__cr_label" "DENY" \
             "compiled successfully but the kernel refused to execute the binary (exit $__cr_rc)"
     else
+        __cr_cleanup
         sp_rec "$SP_CUR" "$__cr_label" "ALLOW" \
             "compiled and executed; program exited $__cr_rc${__cr_out:+: $__cr_out}"
     fi
-    rm -rf "$__cr_dir" 2>/dev/null
     return 0
 }

@@ -441,6 +441,55 @@ check_not_contains "no bare password value survives" "hunter2xyz" "$LEAKOUT"
 check_not_contains "no aws secret value survives" "wJalrXUtnFEMIK7MDENG" "$LEAKOUT"
 check_not_contains "no url password survives" "user:password@" "$LEAKOUT"
 
+# The by-name layer walks the line with a memoised name-end index, so the name
+# of a credential is read from a global copy of the line. Getting that wrong
+# broke every by-name redaction while leaving the suite's shape-based tests
+# green, because those do not reach try_kv at all. So the assertion is made
+# directly, on the exact spacing forms that carry a secret name.
+printf '\nthe by-name layer reaches every spacing form\n'
+for _form in \
+    'password=hunter2xyz' \
+    'password =hunter2xyz' \
+    'password= hunter2xyz' \
+    'password = hunter2xyz' \
+    'password: hunter2xyz' \
+    'password : hunter2xyz' \
+    'password	=hunter2xyz' \
+    'PASSWORD=hunter2xyz' \
+    'Api_Key=hunter2xyz' \
+    'api-key =hunter2xyz' \
+    'apikey= hunter2xyz'
+do
+    _o=$(printf '%s\n' "$_form" | sp_scrub)
+    if [ "$_o" = "$_form" ]; then
+        bad "by-name form redacted: [$_form]" "survived verbatim"
+    else
+        ok "by-name form redacted: [$_form]"
+    fi
+done
+
+# The memoisation must not make the scrubber quadratic. A line of name
+# characters used to cost O(n^2) because try_kv rescanned forward from every
+# position: 16KB took 15.7s and 32KB did not finish inside a minute. A bound
+# is asserted here so a future change that reintroduces the rescan fails a
+# test rather than making the probe unusably slow on one long value.
+_big=$(head -c 32768 /dev/zero | tr '\0' 'a')
+_start=$(date +%s)
+_bigout=$(printf '%s\n' "$_big" | sp_scrub)
+_rc=$?
+_end=$(date +%s)
+_elapsed=$((_end - _start))
+if [ "$_rc" -ne 0 ]; then
+    bad "scrubbing a 32KB value completes" "rc=$_rc"
+elif [ "$_elapsed" -gt 10 ]; then
+    bad "scrubbing a 32KB value completes" "took ${_elapsed}s; the name scan is quadratic again"
+else
+    ok "scrubbing a 32KB value completes in ${_elapsed}s"
+fi
+# 32768, not 32769: $(...) strips the trailing newline, so the captured value
+# is the 32768 input characters and nothing else.
+check_equals "a 32KB benign value survives intact" 32768 "${#_bigout}"
+
 printf '\nprovider token formats are redacted\n'
 for _pfx in "ghp_" "github_pat_" "glpat-" "shpat_" "hvs." "dop_v1_" "npm_" "hf_" "r8_"; do
     _v="${_pfx}$(printf 'abcdefghijklmnopqrstuvwxyz0123456789')"

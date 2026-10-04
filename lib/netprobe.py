@@ -80,6 +80,22 @@ def proxy_endpoints():
 
 def classify(e):
     """Map a socket exception to a verdict. Never collapses distinct failures."""
+    # The TLS branch comes FIRST, ahead of every errno test, because
+    # ssl.SSLError carries errno 1 and would otherwise be caught by the
+    # PermissionError and EPERM branches below and reported as DENY. That is
+    # the worst possible misreading for this branch: a certificate that does
+    # not verify, or a TLS session that ends unexpectedly, means the peer
+    # ANSWERED. Reporting it as a denial tells the reader the sandbox blocked
+    # the connection, when in fact something is on the far end and the
+    # evidence is exactly what an intercepting proxy looks like.
+    if isinstance(e, ssl.SSLCertVerificationError):
+        return UNKNOWN, ("the peer presented a certificate that did not "
+                         "verify against the system trust store, so the "
+                         "connection was established and the certificate is "
+                         "wrong: this is interception evidence, not a refusal: "
+                         "%s" % e)
+    if isinstance(e, ssl.SSLError):
+        return UNKNOWN, "TLS error after the connection was established: %s" % e
     if isinstance(e, socket.gaierror):
         return UNRESOLVED, "DNS: %s" % e
     if isinstance(e, ConnectionRefusedError):
@@ -96,8 +112,6 @@ def classify(e):
         return DENY, "errno %s: %s" % (e.errno, e)
     if isinstance(e, OSError) and e.errno in (111,):
         return REFUSED, "errno 111: %s" % e
-    if isinstance(e, ssl.SSLError):
-        return UNKNOWN, "TLS error: %s" % e
     return UNKNOWN, "%s: %s" % (type(e).__name__, e)
 
 

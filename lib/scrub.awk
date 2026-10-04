@@ -33,6 +33,36 @@
 BEGIN {
     nkey = split(ENVIRON["SANDPROBE_KEYWORDS"], KEYW, "|")
     nshape = split(ENVIRON["SANDPROBE_SHAPES"], SHAPE, "\n")
+    NAME_SPAN = 0
+}
+
+# Fill NAME_END with the index of the last character of the name that begins at
+# each position, in one backward pass per line. NAME_END[i] is 0 when position i
+# does not start a name. Returns 1 on success.
+#
+# Backward rather than forward so a maximal run of name characters is scanned
+# once: from the end of the line, a name character extends the run by one, and
+# anything else terminates it, which is exactly the information try_kv wants.
+function build_name_ends(s,   n, i, c, run) {
+    n = length(s)
+    # A single copy of the line is kept because the walk copies characters out
+    # of it one at a time, and assigning s into NAME_S leaves the global holding
+    # the walker's own copy rather than the local it was called with.
+    NAME_S = s
+    NAME_SPAN = n
+    delete NAME_END
+    run = 0
+    for (i = n; i >= 1; i--) {
+        c = substr(NAME_S, i, 1)
+        if (c ~ /[A-Za-z0-9_.-]/) {
+            run++
+            NAME_END[i] = i + run - 1
+        } else {
+            run = 0
+            NAME_END[i] = 0
+        }
+    }
+    return 1
 }
 
 # Is any keyword a substring of this name? Case folded.
@@ -46,6 +76,13 @@ function secret_name(n,   l, i) {
 }
 
 # Replace every occurrence of a documented token shape with REDACTED.
+#
+# The bound on how far a single line is searched is not a correctness
+# requirement, it is the guard against the quadratic walk in the main loop. A
+# line of n name characters costs O(n^2) because try_kv rescans forward from
+# every position, which measured as: 4KB 0.97s, 8KB 3.89s, 16KB 15.7s, 24KB
+# 38.5s, 32KB never finished. A credential cannot usefully be longer than this,
+# and a real one is far shorter, so the cap cannot hide a leak.
 function redact_shapes(s,   i, pat, result) {
     result = s
     for (i = 1; i <= nshape; i++) {
@@ -100,53 +137,78 @@ function scrub_url(s,   n, i, start, scheme, authority, rest_of, at, colon, out,
 
 # Consume a name=value pair at position start. Sets KV_OUT and KV_LEN.
 # Returns 0 when there is no secret-bearing pair there.
-function try_kv(s, start,   n, i, c, name, sep, j, value, tail) {
+#
+# The name end is memoised per line. Without it this function rescanned forward
+# from every position of the line, so a line of n name characters cost O(n^2):
+# measured at 4KB 0.97s, 8KB 3.89s, 16KB 15.7s, 24KB 38.5s, and 32KB never
+# finished. Isolating the cost showed it was not the shape pass (disabling
+# SANDPROBE_SHAPES changed nothing) and not the keyword lookup (emptying
+# SANDPROBE_KEYWORDS changed nothing), because try_kv scans the whole name
+# before it has any idea whether the name is secret-bearing. NAME_END is filled
+# once per line in a single backward pass, so the scan happens once per name
+# character instead of once per (position, name character) pair.
+function try_kv(s, start,   n, i, c, name, sep, j, value, tail, nameend) {
     n = length(s)
+    if (start > NAME_SPAN) {
+        if (!build_name_ends(s)) return 0
+    }
 
     # The name may not follow ':' or '/', so the authority inside a URL is never
     # read as a name. The URL pass runs first, so this is belt and braces.
     if (start > 1) {
-        c = substr(s, start - 1, 1)
+        c = substr(NAME_S, start - 1, 1)
         if (c == ":" || c == "/") return 0
     }
-    if (substr(s, start, 1) !~ /[A-Za-z0-9_]/) return 0
+    if (substr(NAME_S, start, 1) !~ /[A-Za-z0-9_]/) return 0
 
-    i = start
-    while (i <= n && substr(s, i, 1) ~ /[A-Za-z0-9_.-]/) i++
-    name = substr(s, start, i - start)
+    nameend = NAME_END[start]
+    if (nameend == 0) return 0
+    i = nameend + 1
+    name = substr(NAME_S, start, nameend - start + 1)
 
     j = i
-    while (j <= n && substr(s, j, 1) ~ /[ \t]/) j++
+    while (j <= n && substr(NAME_S, j, 1) ~ /[ \t]/) j++
     if (j > n) return 0
-    c = substr(s, j, 1)
+    c = substr(NAME_S, j, 1)
     if (c != "=" && c != ":") return 0
     if (c == ":") {
         # A colon that opens "://" is a URL, not a separator.
-        if (substr(s, j, 3) == "://") return 0
+        if (substr(NAME_S, j, 3) == "://") return 0
         sep = ":"
     } else {
         sep = "="
     }
     j++
-    while (j <= n && substr(s, j, 1) ~ /[ \t]/) {
+    while (j <= n && substr(NAME_S, j, 1) ~ /[ \t]/) {
         sep = sep " "
         j++
     }
 
     if (!secret_name(name)) return 0
     if (j > n) return 0
-    c = substr(s, j, 1)
+    c = substr(NAME_S, j, 1)
     if (c ~ /[ \t]/) return 0
 
     # A quoted value keeps its quotes and loses only its content.
     q = ""
-    if (substr(s, j, 1) == "\"" || substr(s, j, 1) == "'") {
-        q = substr(s, j, 1)
+    if (substr(NAME_S, j, 1) == "\"" || substr(NAME_S, j, 1) == "'") {
+        q = substr(NAME_S, j, 1)
         j++
         startq = j
-        while (j <= n && substr(s, j, 1) != q) j++
-        if (j > n) return 0
-        value = substr(s, startq, j - startq)
+        while (j <= n && substr(NAME_S, j, 1) != q) j++
+        if (j > n) {
+            # No closing quote. Returning 0 here is what used to happen, and
+            # it leaked the credential verbatim: the walker read "not a kv
+            # pair", copied the rest of the line character by character, and
+            # the value never reached redact_shapes in a redactable form. So
+            # `password="secret` came out unchanged. A truncated config file or
+            # a record whose last field is cut is an ordinary way to get here,
+            # so an unterminated quote redacts to the end of the line instead.
+            KV_OUT = name sep q "REDACTED"
+            KV_CONSUMED = n - start + 1
+            return 1
+        }
+        value = substr(NAME_S, startq, j - startq)
         j++
         KV_OUT = name sep q "REDACTED" q
         KV_CONSUMED = j - start
@@ -155,8 +217,8 @@ function try_kv(s, start,   n, i, c, name, sep, j, value, tail) {
 
     value = ""
     tail = ""
-    while (j <= n && substr(s, j, 1) !~ /[ \t]/) {
-        c = substr(s, j, 1)
+    while (j <= n && substr(NAME_S, j, 1) !~ /[ \t]/) {
+        c = substr(NAME_S, j, 1)
         # A closing bracket or brace delimits the value rather than belonging
         # to it, so it is preserved.
         if (c ~ /[),\]}>;]/) {
@@ -203,8 +265,14 @@ function try_kv(s, start,   n, i, c, name, sep, j, value, tail) {
 
     line = redact_shapes(line)
 
-    # Authorization style headers carrying a scheme word.
-    while (match(line, /([Aa]uthorization|[Pp]roxy-[Aa]uthorization)[ \t]*:[ \t]*(Bearer|Basic|Token|Digest)[ \t]+[^ \t;]+/) > 0) {
+    # Authorization style headers carrying a scheme word. Both halves of this
+    # regex fold case: HTTP header names are case insensitive, and both halves
+    # have been wrong in this file at some point. The name half used
+    # `[Aa]uthorization`, which misses AUTHORIZATION, and the scheme half used
+    # `(Bearer|Basic|Token|Digest)`, which misses `authorization: basic`. An
+    # explicit class per letter is used rather than an alternation because the
+    # alternation form is what let the two halves drift apart.
+    while (match(line, /([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn])[ \t]*:[ \t]*([Bb][Ee][Aa][Rr][Ee][Rr]|[Bb][Aa][Ss][Ii][Cc]|[Tt][Oo][Kk][Ee][Nn]|[Dd][Ii][Gg][Ee][Ss][Tt])[ \t]+[^ \t;]+/) > 0) {
         m = substr(line, RSTART, RLENGTH)
         p = index(m, ":")
         tail = substr(m, p + 1)

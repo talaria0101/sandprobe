@@ -310,10 +310,15 @@ sp_section_security() {
     # cgroup escape via release_agent. On cgroup v1 writing
     # notify_on_release plus release_agent to a controlled file runs a command
     # as root. On v2 the equivalent is cgroup.release_agent.
+    _cg_tried=0
     for f in /sys/fs/cgroup/release_agent /sys/fs/cgroup/notify \
              /sys/fs/cgroup/cgroup.release_agent /sys/fs/cgroup/*/release_agent \
              /sys/fs/cgroup/*/notify_on_release; do
+        # The globs expand to themselves when they match nothing, so a literal
+        # pattern that does not exist would be tested as if it were a path.
+        case "$f" in *'*'*) [ -e "$f" ] || continue ;; esac
         [ -e "$f" ] || continue
+        _cg_tried=$((_cg_tried + 1))
         sp_kv "cgroup_file_present" "$f"
         _werr=$(sh -c ': > "$1"' sh "$f" 2>&1)
         if [ -z "$_werr" ]; then
@@ -327,8 +332,19 @@ sp_section_security() {
                 "$(sp_verdict_from_err "$_werr")" "$_werr"
         fi
     done
-    sp_rec "escape-surface" "cgroup_escape" "UNKNOWN" \
-        "no cgroup v1 release_agent path was writable; see the rows above for each file tried"
+    # The summary row used to be emitted unconditionally, with a detail saying
+    # "see the rows above for each file tried". When no candidate path exists at
+    # all the loop emits nothing, so that sentence pointed at rows that were not
+    # there and described an attempt that was never made. The count is tracked
+    # so the summary distinguishes "tried and none writable" from "nothing to
+    # try", which are different answers about the sandbox.
+    if [ "$_cg_tried" -gt 0 ]; then
+        sp_rec "escape-surface" "cgroup_escape" "UNKNOWN" \
+            "$_cg_tried cgroup release path(s) were tried and none accepted a write; see the rows above for each one"
+    else
+        sp_rec "escape-surface" "cgroup_escape" "UNKNOWN" \
+            "no cgroup v1 release_agent or v2 cgroup.release_agent path exists on this host, so the primitive was not tested rather than refused; the paths tried are listed above and none were present"
+    fi
 
     # Preload and dynamic linker hijack.
     for f in /etc/ld.so.preload "${HOME:-/nonexistent}/.ld.so.preload"; do
@@ -370,17 +386,38 @@ sp_section_security() {
     # Shared /tmp is a cross-user attack surface when the sticky bit is absent.
     if [ -d /tmp ]; then
         sp_kv "tmp_mode" "$(stat -c '%A %a %U' /tmp 2>/dev/null || echo UNREADABLE)"
-        case "$(stat -c '%a' /tmp 2>/dev/null)" in
+        # The three properties below are read from the MODE, never from
+        # `test -w`. test -w is an access check against the calling uid, and
+        # this probe runs as uid 0, so it answered yes for a mode-755 /tmp and
+        # the report contradicted its own tmp_mode line one row above. Both
+        # questions are kept, because they are different questions: the mode is
+        # the security property, and whether this process can write is not.
+        _tmp_mode_oct="$(stat -c '%a' /tmp 2>/dev/null)"
+        # %a is 3 or 4 digits with no leading zero for a setuid/sticky dir
+        # whose digit is zero, so pad before indexing.
+        while [ "${#_tmp_mode_oct}" -lt 4 ]; do
+            _tmp_mode_oct="0$_tmp_mode_oct"
+        done
+        case "$_tmp_mode_oct" in
             1???|???????1|??????1??|??1?????|?1??????)
                 sp_rec "escape-surface" "tmp_sticky_bit" "ALLOW" \
-                    "the sticky bit is set, so users cannot remove each other's files here" ;;
+                    "the sticky bit is set (mode $_tmp_mode_oct), so users cannot remove each other's files here" ;;
             "")
                 sp_rec "escape-surface" "tmp_sticky_bit" "UNKNOWN" "the mode of /tmp could not be read" ;;
             *)
                 sp_rec "escape-surface" "tmp_sticky_bit" "DENY" \
-                    "the sticky bit is not set on a world-writable /tmp, so one session can replace another session's files" ;;
+                    "the sticky bit is not set (mode $_tmp_mode_oct), so on a world-writable /tmp one session could replace another session's files" ;;
         esac
-        sp_kv "tmp_world_writable" "$( [ -w /tmp ] && echo yes || echo no )"
+        case "$_tmp_mode_oct" in
+            ""|???[2367])
+                sp_kv "tmp_world_writable" "yes (the other-write bit is set in mode $_tmp_mode_oct)" ;;
+            *)
+                sp_kv "tmp_world_writable" "no (mode $_tmp_mode_oct has no other-write bit)" ;;
+        esac
+        # What this process can actually do, kept separate and named for what
+        # it answers, so it is not mistaken for the mode property above.
+        sp_kv "tmp_writable_by_this_process" \
+            "$( [ -w /tmp ] && echo "yes, uid $(id -u)" || echo "no, uid $(id -u)" )"
     fi
 
     # Hardlink to a setuid binary, the classic privesc when protected_hardlinks

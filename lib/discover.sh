@@ -231,12 +231,38 @@ sp_discover_files() {
     return 0
 }
 
-# Device nodes to probe. /dev is usually a small tmpfs, so most of these are
-# legitimately absent. Absence is reported as ABSENT, never DENY.
-SP_DEVICE_NODES="/dev/null /dev/zero /dev/full /dev/random /dev/urandom /dev/tty /dev/ptmx /dev/console /dev/shm /dev/mem /dev/kmem /dev/sda /dev/sdb /dev/nvme0n1 /dev/kvm /dev/fuse /dev/initctl /dev/watchdog /dev/net/tun /dev/dri/card0 /dev/snd/controlC0"
+# Device nodes to probe and the subset that may be written without harm are
+# both built by sp_discover_devices, one entry per line in $SP_WORK/dev.nodes
+# and $SP_WORK/dev.write, so the consumers in sect_fs.sh can read them with
+# `while IFS= read -r` instead of word-splitting a space separated variable.
 
-# Devices that may be written without harm.
-SP_DEVICE_WRITE_SAFE="/dev/null /dev/zero /dev/full /dev/random /dev/urandom"
+sp_discover_devices() {
+    _t="$SP_WORK/dev.nodes"
+    : > "$_t"
+    # Written one entry per line rather than space separated, so the consumer
+    # reads them with `while IFS= read -r`. A space separated list consumed by
+    # an unquoted expansion word-splits, so a path containing a space or a glob
+    # becomes two probes for paths that do not exist. These particular lists
+    # are literals so the bug cannot fire here, but the pattern was wrong and
+    # the next entry added to either list would inherit it.
+    printf '%s\n' /dev/null /dev/zero /dev/full /dev/random /dev/urandom \
+        /dev/tty /dev/ptmx /dev/console /dev/shm /dev/mem /dev/kmem \
+        /dev/sda /dev/sdb /dev/nvme0n1 /dev/kvm /dev/fuse /dev/initctl \
+        /dev/watchdog /dev/net/tun /dev/dri/card0 /dev/snd/controlC0 \
+        | LC_ALL=C sort -u > "$_t"
+    SP_DEVICE_NODES=$(cat "$_t" 2>/dev/null)
+
+    _t="$SP_WORK/dev.write"
+    : > "$_t"
+    # Writing to these is harmless by construction: /dev/null discards,
+    # /dev/zero and /dev/full have no backing store, and /dev/random and
+    # /dev/urandom are entropy sources with no write side. Every other device
+    # is probed for existence only.
+    printf '%s\n' /dev/null /dev/zero /dev/full /dev/random /dev/urandom \
+        | LC_ALL=C sort -u > "$_t"
+    SP_DEVICE_WRITE_SAFE=$(cat "$_t" 2>/dev/null)
+    return 0
+}
 
 sp_discover_all() {
     sp_discover_mounts
@@ -244,6 +270,7 @@ sp_discover_all() {
     sp_discover_homes
     sp_discover_dirs
     sp_discover_files
+    sp_discover_devices
     return 0
 }
 

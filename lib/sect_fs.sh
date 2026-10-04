@@ -65,17 +65,28 @@ sp_section_fs() {
 
     printf '\n## DIRECTORY WRITE MATRIX\n\n'
     sp_raw "# probe: create and delete a uniquely named file in each directory"
-    for d in $SP_CANDIDATE_DIRS; do
+    # Read from the sorted file rather than from an unquoted expansion of
+    # $SP_CANDIDATE_DIRS. That expansion word-split on IFS, so a discovered
+    # path containing a space became two probes for paths that do not exist
+    # ("/mnt/My Disk" became "/mnt/My" and "Disk") and the real directory was
+    # never probed. It also globbed, so a candidate containing '*' expanded to
+    # whatever else was in that directory. Discovery reads mount targets and
+    # bind sources out of /proc/self/mountinfo, so such a path is authored by
+    # the host, not by this tool.
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
         sp_try_write "$d"
-    done
+    done < "$SP_WORK/cand.dirs.sorted"
 
     printf '\n## DIRECTORY READ MATRIX\n\n'
-    for d in $SP_CANDIDATE_DIRS; do
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
         sp_try_read "$d"
-    done
+    done < "$SP_WORK/cand.dirs.sorted"
 
     printf '\n## FILE READ MATRIX\n\n'
-    for f in $SP_CANDIDATE_FILES; do
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
         if [ ! -e "$f" ]; then
             sp_rec "$SP_CUR" "read:$f" "ABSENT" "not present on this host"
             continue
@@ -97,10 +108,11 @@ sp_section_fs() {
         else
             sp_rec "$SP_CUR" "read:$f" "$(sp_verdict_from_err "$_err")" "$_err"
         fi
-    done
+    done < "$SP_WORK/cand.files.sorted"
 
     printf '\n## DEVICE ACCESS\n\n'
-    for d in $SP_DEVICE_NODES; do
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
         if [ ! -e "$d" ]; then
             sp_rec "$SP_CUR" "device:$d" "ABSENT" "device node not present"
             continue
@@ -129,10 +141,11 @@ sp_section_fs() {
         else
             sp_rec "$SP_CUR" "read:$d" "$(sp_verdict_from_err "$_err")" "$_err, perms $_perm"
         fi
-    done
+    done < "$SP_WORK/dev.nodes"
 
     printf '\n## DEVICE WRITE ACCESS\n\n'
-    for d in $SP_DEVICE_WRITE_SAFE; do
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
         if [ ! -e "$d" ]; then
             sp_rec "$SP_CUR" "device-write:$d" "ABSENT" "device node not present"
             continue
@@ -146,7 +159,7 @@ sp_section_fs() {
         else
             sp_rec "$SP_CUR" "device-write:$d" "$(sp_verdict_from_err "$_err")" "$_err"
         fi
-    done
+    done < "$SP_WORK/dev.write"
     sp_raw "# note: writing to /dev/zero, /dev/null and /dev/full is harmless."
     sp_raw "# /dev/tty writes are reported as observed, not suppressed."
 

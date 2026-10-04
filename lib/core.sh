@@ -207,6 +207,15 @@ sp_kv() {
         return 0
     fi
     __sp_flat=$(printf '%s' "$__sp_val" | tr '\n\r\t' '   ' | sp_scrub)
+    __sp_rc=$?
+    # A scrubber that could not run used to produce an empty value here and
+    # exit 0, so the report was written complete and blank. This checks the
+    # status sp_scrub returns instead of discarding it, and aborts rather than
+    # reporting a measurement that was never taken.
+    if [ "$__sp_rc" -ne 0 ]; then
+        echo "sandprobe: cannot emit '$__sp_key': the credential scrubber failed (rc=$__sp_rc)" >&2
+        exit 70
+    fi
     printf '%s = %s\n' "$__sp_key" "$__sp_flat"
     return 0
 }
@@ -223,10 +232,25 @@ sp_rec() {
     __sp_sec="$1"; __sp_id="$2"; __sp_verdict="$3"; __sp_detail="${4-}"
     case "$__sp_verdict" in
         ALLOW|DENY|ABSENT|UNKNOWN|TIMEOUT|EXHAUSTED|UNRESOLVED|REFUSED|DROPPED) ;;
-        *) __sp_verdict="UNKNOWN"
-           __sp_detail="INTERNAL BUG: invalid verdict '$__sp_verdict' in '$__sp_sec/$__sp_id'" ;;
+        *) # The offending value is captured BEFORE it is overwritten. The
+           # message used to interpolate __sp_verdict after assigning UNKNOWN
+           # to it, so it always read "invalid verdict 'UNKNOWN'" and named
+           # nothing a reader could act on.
+           __sp_bad="$__sp_verdict"
+           __sp_verdict="UNKNOWN"
+           __sp_detail="INTERNAL BUG: invalid verdict '$__sp_bad' in '$__sp_sec/$__sp_id'" ;;
     esac
     __sp_detail=$(printf '%s' "$__sp_detail" | tr '\t\n' '  ' | sp_scrub)
+    __sp_rc=$?
+    # Same contract as sp_kv: a scrubber that could not run must not become an
+    # empty detail on a record that looks complete. Exiting here is deliberate
+    # over degrading the verdict, because a blank detail on an ALLOW is exactly
+    # the "looks measured but is not" failure the verdict vocabulary exists to
+    # prevent.
+    if [ "$__sp_rc" -ne 0 ]; then
+        echo "sandprobe: cannot emit $__sp_sec/$__sp_id: the credential scrubber failed (rc=$__sp_rc)" >&2
+        exit 70
+    fi
     printf '%s\t%s\t%s\t%s\n' "$__sp_sec" "$__sp_id" "$__sp_verdict" "$__sp_detail"
 }
 
